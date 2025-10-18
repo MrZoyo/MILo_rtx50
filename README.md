@@ -300,7 +300,46 @@ python mesh_extract_sdf.py \
 
 * **`./output/Ignatius/mesh_learnable_sdf.ply`** (confirmed to open normally in MeshLab)
 
-### 3) Rendering
+### 3) Mesh Cleaning and Format Conversion (Optional)
+
+The extracted PLY mesh may contain small isolated components or noise. We provide the `clean_convert_mesh.py` script to clean the mesh and convert it to multiple formats (PLY/OBJ/GLB).
+
+**Install Additional Dependencies**
+```bash
+pip install pymeshlab trimesh plyfile
+```
+
+**Basic Usage**
+```bash
+# Basic cleaning and conversion (outputs PLY, OBJ, GLB)
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply
+
+# Simplify mesh to 300k triangles
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --simplify 300000
+
+# Custom small component removal threshold (default 0.02 = 2% of bbox diagonal)
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --keep-components 0.02
+
+# Output only PLY and OBJ, skip GLB
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --no-glb
+
+# Specify output directory and filename prefix
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply \
+  --out-dir ./output/Ignatius/cleaned \
+  --stem mesh_final
+```
+
+**Main Features**
+- **Mesh Cleaning**: Remove duplicate vertices/faces, fix non-manifold edges, remove small floating components
+- **Mesh Simplification**: Shape-preserving simplification based on Quadric decimation
+- **Format Conversion**: Support output in PLY (with vertex colors), OBJ, and GLB formats
+
+**Output** (saved in input file directory by default)
+* `mesh_clean.ply` - Cleaned PLY mesh (with vertex colors)
+* `mesh_clean.obj` - OBJ format (Note: OBJ doesn't support vertex colors)
+* `mesh_clean.glb` - GLB format (suitable for Web display and 3D software import)
+
+### 4) Rendering
 
 ```bash
 python render.py \
@@ -314,7 +353,7 @@ python render.py \
 
 * Rendered images (train/test views), saved to the rendering subdirectory in the model output directory (as indicated by script output)
 
-### 4) Image Metrics
+### 5) Image Metrics
 
 ```bash
 python metrics.py -m ./output/Ignatius
