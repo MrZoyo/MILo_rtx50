@@ -301,46 +301,7 @@ python mesh_extract_sdf.py \
 
 * **`./output/Ignatius/mesh_learnable_sdf.ply`**（已确认可在 MeshLab 正常打开）
 
-### 3) 网格清理与格式转换（可选）
-
-提取的 PLY 网格可能包含小的孤立组件或噪声。我们提供了 `clean_convert_mesh.py` 脚本来清理网格并转换为多种格式（PLY/OBJ/GLB）。
-
-**安装额外依赖**
-```bash
-pip install pymeshlab trimesh plyfile
-```
-
-**基本用法**
-```bash
-# 基本清理和转换（输出 PLY、OBJ、GLB）
-python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply
-
-# 网格简化到 30 万三角形
-python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --simplify 300000
-
-# 自定义小组件移除阈值（默认 0.02 = 2% bbox 对角线长度）
-python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --keep-components 0.02
-
-# 只输出 PLY 和 OBJ，不输出 GLB
-python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --no-glb
-
-# 指定输出目录和文件名前缀
-python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply \
-  --out-dir ./output/Ignatius/cleaned \
-  --stem mesh_final
-```
-
-**主要功能**
-- **网格清理**：去除重复顶点/面、修复非流形边、移除小浮块
-- **网格简化**：基于 Quadric decimation 的保形简化
-- **格式转换**：支持输出 PLY（带顶点颜色）、OBJ、GLB 格式
-
-**产出**（默认保存在输入文件同目录）
-* `mesh_clean.ply` - 清理后的 PLY 网格（带顶点颜色）
-* `mesh_clean.obj` - OBJ 格式（注意：OBJ 不支持顶点颜色）
-* `mesh_clean.glb` - GLB 格式（适合 Web 展示和 3D 软件导入）
-
-### 4) 渲染
+### 3) 渲染
 
 ```bash
 python render.py \
@@ -354,7 +315,7 @@ python render.py \
 
 * 渲染图像（训练/测试视角），保存到模型输出目录中的渲染子目录（以脚本实际打印为准）
 
-### 5) 图像指标
+### 4) 图像指标
 
 ```bash
 python metrics.py -m ./output/Ignatius
@@ -363,6 +324,46 @@ python metrics.py -m ./output/Ignatius
 **产出**
 
 * 控制台输出 PSNR/SSIM（以及仓库脚本保存的对应文件，位于模型目录下；以实际实现为准）
+
+### 5) PLY 格式转换（可选）
+
+提取的 PLY 网格可以使用 `clean_convert_mesh.py` 脚本转换为其他常用的 3D 格式（OBJ/GLB）以便在各种 3D 软件中使用。脚本同时提供网格清理功能作为可选项。
+
+**安装额外依赖**
+```bash
+pip install pymeshlab trimesh plyfile
+```
+
+**基本用法**
+```bash
+# 基本转换（输出 PLY、OBJ、GLB）
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply
+
+# 转换并简化到 30 万三角形
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --simplify 300000
+
+# 转换时清理小组件（默认 0.02 = 移除直径小于 2% bbox 对角线的组件）
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --keep-components 0.02
+
+# 只输出特定格式
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --no-glb  # 不输出 GLB
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --no-obj  # 不输出 OBJ
+
+# 指定输出目录和文件名
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply \
+  --out-dir ./output/Ignatius/converted \
+  --stem mesh_final
+```
+
+**主要功能**
+- **格式转换**：将 PLY 转换为 OBJ、GLB 格式（适合不同 3D 软件和 Web 展示）
+- **可选清理**：去除重复顶点/面、修复非流形边、移除小浮块
+- **可选简化**：基于 Quadric decimation 的保形简化
+
+**产出**（默认保存在输入文件同目录）
+* `mesh_clean.ply` - 转换后的 PLY 网格（带顶点颜色）
+* `mesh_clean.obj` - OBJ 格式（注意：OBJ 不支持顶点颜色）
+* `mesh_clean.glb` - GLB 格式（适合 Web 展示和 Blender/Unity 等软件导入）
 
 ---
 

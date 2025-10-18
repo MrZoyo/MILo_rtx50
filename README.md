@@ -300,46 +300,7 @@ python mesh_extract_sdf.py \
 
 * **`./output/Ignatius/mesh_learnable_sdf.ply`** (confirmed to open normally in MeshLab)
 
-### 3) Mesh Cleaning and Format Conversion (Optional)
-
-The extracted PLY mesh may contain small isolated components or noise. We provide the `clean_convert_mesh.py` script to clean the mesh and convert it to multiple formats (PLY/OBJ/GLB).
-
-**Install Additional Dependencies**
-```bash
-pip install pymeshlab trimesh plyfile
-```
-
-**Basic Usage**
-```bash
-# Basic cleaning and conversion (outputs PLY, OBJ, GLB)
-python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply
-
-# Simplify mesh to 300k triangles
-python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --simplify 300000
-
-# Custom small component removal threshold (default 0.02 = 2% of bbox diagonal)
-python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --keep-components 0.02
-
-# Output only PLY and OBJ, skip GLB
-python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --no-glb
-
-# Specify output directory and filename prefix
-python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply \
-  --out-dir ./output/Ignatius/cleaned \
-  --stem mesh_final
-```
-
-**Main Features**
-- **Mesh Cleaning**: Remove duplicate vertices/faces, fix non-manifold edges, remove small floating components
-- **Mesh Simplification**: Shape-preserving simplification based on Quadric decimation
-- **Format Conversion**: Support output in PLY (with vertex colors), OBJ, and GLB formats
-
-**Output** (saved in input file directory by default)
-* `mesh_clean.ply` - Cleaned PLY mesh (with vertex colors)
-* `mesh_clean.obj` - OBJ format (Note: OBJ doesn't support vertex colors)
-* `mesh_clean.glb` - GLB format (suitable for Web display and 3D software import)
-
-### 4) Rendering
+### 3) Rendering
 
 ```bash
 python render.py \
@@ -353,7 +314,7 @@ python render.py \
 
 * Rendered images (train/test views), saved to the rendering subdirectory in the model output directory (as indicated by script output)
 
-### 5) Image Metrics
+### 4) Image Metrics
 
 ```bash
 python metrics.py -m ./output/Ignatius
@@ -362,6 +323,46 @@ python metrics.py -m ./output/Ignatius
 **Output**
 
 * Console output of PSNR/SSIM (and corresponding files saved by repo script, located in model directory; based on actual implementation)
+
+### 5) PLY Format Conversion (Optional)
+
+The extracted PLY mesh can be converted to other common 3D formats (OBJ/GLB) using the `clean_convert_mesh.py` script for use in various 3D software. The script also provides optional mesh cleaning functionality.
+
+**Install Additional Dependencies**
+```bash
+pip install pymeshlab trimesh plyfile
+```
+
+**Basic Usage**
+```bash
+# Basic conversion (outputs PLY, OBJ, GLB)
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply
+
+# Convert and simplify to 300k triangles
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --simplify 300000
+
+# Clean small components during conversion (default 0.02 = remove components with diameter < 2% bbox diagonal)
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --keep-components 0.02
+
+# Output only specific formats
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --no-glb  # Skip GLB
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply --no-obj  # Skip OBJ
+
+# Specify output directory and filename
+python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply \
+  --out-dir ./output/Ignatius/converted \
+  --stem mesh_final
+```
+
+**Main Features**
+- **Format Conversion**: Convert PLY to OBJ and GLB formats (suitable for different 3D software and Web display)
+- **Optional Cleaning**: Remove duplicate vertices/faces, fix non-manifold edges, remove small floating components
+- **Optional Simplification**: Shape-preserving simplification based on Quadric decimation
+
+**Output** (saved in input file directory by default)
+* `mesh_clean.ply` - Converted PLY mesh (with vertex colors)
+* `mesh_clean.obj` - OBJ format (Note: OBJ doesn't support vertex colors)
+* `mesh_clean.glb` - GLB format (suitable for Web display and import into Blender/Unity etc.)
 
 ---
 
