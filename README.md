@@ -28,9 +28,11 @@
 
 ---
 
-## Submodules Installation (All via **pip**, No Conda Required)
+## Submodules Installation
 
 > We have verified these can be successfully compiled/installed with CUDA 12.8 + PyTorch 2.7.1.
+
+### 1) Install Gaussian Splatting Submodules (via **pip**)
 
 ```bash
 pip install submodules/diff-gaussian-rasterization_ms
@@ -43,6 +45,79 @@ pip install submodules/fused-ssim
 > Note: `nvdiffrast` uses **JIT compilation** (triggered at runtime by PyTorch cpp_extension).
 > If choosing **OpenGL(GL) backend**, system headers are required: `sudo apt install -y libegl-dev libopengl-dev libgles2-mesa-dev ninja-build`.
 > We switched to **CUDA backend** for simplicity: `export NVDIFRAST_BACKEND=cuda` (no EGL headers needed).
+
+### 2) Install System Dependencies for `tetra_triangulation` (Delaunay Triangulation)
+
+The original project uses **conda** to install system-level C/C++ dependencies (cmake/gmp/cgal). Since we use **uv** for Python packages only, we need to install these C/C++ libraries via **apt** (system package manager):
+
+```bash
+# Install C/C++ dependencies via apt (Ubuntu 24.04)
+sudo apt update
+sudo apt install -y \
+  build-essential \
+  cmake ninja-build \
+  libgmp-dev libmpfr-dev libcgal-dev \
+  libboost-all-dev
+
+# (Optional) May be needed:
+# sudo apt install -y libeigen3-dev
+```
+
+**Notes:**
+- `libcgal-dev` provides CGAL headers (header-only on Ubuntu 24.04)
+- `libgmp-dev` and `libmpfr-dev` are numerical backends for CGAL
+- **uv only manages Python packages**; C/C++ dependencies must be installed via system package managers (apt/brew/pacman)
+- For **macOS**: `brew install cmake cgal gmp mpfr boost`
+- For **Arch Linux**: `sudo pacman -S cgal gmp mpfr boost cmake base-devel`
+
+### 3) Compile `tetra_triangulation` with ABI Alignment
+
+> **Important:** This module requires ABI alignment with PyTorch 2.7.1 (C++11 ABI=1). We use a header file approach to enforce this.
+
+**a) Create ABI enforcement header:**
+
+Create `submodules/tetra_triangulation/src/force_abi.h`:
+```cpp
+#pragma once
+// Force new ABI before any STL headers
+#if defined(_GLIBCXX_USE_CXX11_ABI)
+#  undef _GLIBCXX_USE_CXX11_ABI
+#endif
+#define _GLIBCXX_USE_CXX11_ABI 1
+```
+
+**b) Modify source files:**
+
+Add `#include "force_abi.h"` as the **first line** of:
+- `submodules/tetra_triangulation/src/py_binding.cpp`
+- `submodules/tetra_triangulation/src/triangulation.cpp`
+
+**c) Build and install:**
+
+```bash
+cd submodules/tetra_triangulation
+rm -rf build CMakeCache.txt CMakeFiles tetranerf/utils/extension/tetranerf_cpp_extension*.so
+
+# Point to current PyTorch's CMake prefix/dynamic library path
+export CMAKE_PREFIX_PATH="$(python - <<'PY'
+import torch; print(torch.utils.cmake_prefix_path)
+PY
+)"
+export TORCH_LIB_DIR="$(python - <<'PY'
+import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))
+PY
+)"
+export LD_LIBRARY_PATH="$TORCH_LIB_DIR:$LD_LIBRARY_PATH"
+
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" .
+cmake --build . -j"$(nproc)"
+
+# Install (optional, convenient for editable reference)
+uv pip install -e .
+cd ../../
+```
+
+> **Note:** For troubleshooting ABI issues, see **Key Issue 1** section below.
 
 ---
 
@@ -58,9 +133,9 @@ undefined symbol: _ZN3c106detail14torchCheckFailEPKcS2_jRKSs
 The trailing `RKSs` indicates **old ABI (_GLIBCXX_USE_CXX11_ABI=0)**, while our PyTorch 2.7.1 uses **new ABI (=1)**.
 
 **Fix**
-Add a header file to force ABI in `submodules/tetra_triangulation`, and add an extra layer of protection in CMake to **stably lock ABI=1**:
+Add a header file to force ABI in `submodules/tetra_triangulation` to **stably lock ABI=1**:
 
-* New file: `src/force_abi.h`
+* Create file: `src/force_abi.h`
 
   ```cpp
   #pragma once
@@ -71,25 +146,13 @@ Add a header file to force ABI in `submodules/tetra_triangulation`, and add an e
   #define _GLIBCXX_USE_CXX11_ABI 1
   ```
 
-* Modify: Add to the first line of `src/py_binding.cpp` and `src/triangulation.cpp`
+* Modify: Add `#include "force_abi.h"` as the **first line** of `src/py_binding.cpp` and `src/triangulation.cpp`
 
   ```cpp
   #include "force_abi.h"
   ```
 
-* In `CMakeLists.txt`, after `add_library(tetranerf_cpp_extension ...)`, add (read ABI from PyTorch and apply to target):
-
-  ```cmake
-  execute_process(
-    COMMAND ${PYTHON_EXECUTABLE} - <<PY
-  import torch, sys
-  sys.stdout.write(str(int(torch._C._GLIBCXX_USE_CXX11_ABI)))
-  PY
-    OUTPUT_VARIABLE TORCH_ABI
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-  message(STATUS "Forcing _GLIBCXX_USE_CXX11_ABI=${TORCH_ABI} for tetranerf_cpp_extension")
-  target_compile_definitions(tetranerf_cpp_extension PRIVATE _GLIBCXX_USE_CXX11_ABI=${TORCH_ABI})
-  ```
+> **Note:** This header file approach is sufficient to enforce ABI=1. No additional CMakeLists.txt modifications are needed.
 
 **Build Commands (in-source, outputs to package path)**
 
@@ -370,8 +433,7 @@ python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply \
 
 1. **`submodules/tetra_triangulation`**
 
-   * Added `src/force_abi.h`, and `#include "force_abi.h"` at the first line of two source files: **Force use of C++11 new ABI (=1)**
-   * Added `target_compile_definitions(_GLIBCXX_USE_CXX11_ABI=${TORCH_ABI})` to target `tetranerf_cpp_extension` in `CMakeLists.txt` (read from current PyTorch)
+   * Added `src/force_abi.h`, and `#include "force_abi.h"` at the first line of `src/py_binding.cpp` and `src/triangulation.cpp`: **Force use of C++11 new ABI (=1)**
 
 2. **`milo/scene/mesh.py`**
 

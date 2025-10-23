@@ -1,7 +1,7 @@
 # Core dependencies
-torch==2.7.1+cu128
-torchvision==0.22.1+cu128
-torchaudio==2.7.1+cu128
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
 numpy==2.3.3
 pillow==11.3.0
 scipy==1.16.2

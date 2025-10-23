@@ -1,4 +1,3 @@
-````markdown
 # MILo_rtx50 — CUDA 12.8 / RTX 50 系列本地编译与运行记录（Ubuntu 24.04 + uv + PyTorch 2.7.1+cu128）
 
 > 本 README 记录我们在 **RTX 50 系列 + CUDA 12.8** 环境下，fork 项目 [Anttwo/MILo](https://github.com/Anttwo/MILo) 的**本地编译适配、关键修改与可复现实验步骤**。
@@ -25,13 +24,15 @@
   export MILO_MESH_RES_SCALE=0.3
   # （可选）按三角形分块的大小，缓解 nvdiffrast CUDA 后端显存峰值
   export MILO_RAST_TRI_CHUNK=150000
-````
+  ```
 
 ---
 
-## Submodules 安装（均为 **pip 安装**，无需 Conda）
+## Submodules 安装
 
 > 这些我们已验证可在 CUDA 12.8 + PyTorch 2.7.1 下成功编译/安装。
+
+### 1) 安装 Gaussian Splatting 子模块（通过 **pip**）
 
 ```bash
 pip install submodules/diff-gaussian-rasterization_ms
@@ -44,6 +45,79 @@ pip install submodules/fused-ssim
 > 备注：`nvdiffrast` 走 **JIT 编译**（运行时由 PyTorch cpp_extension 触发）。
 > 若选择 **OpenGL(GL) 后端**，需要系统头：`sudo apt install -y libegl-dev libopengl-dev libgles2-mesa-dev ninja-build`。
 > 我们为省事改用 **CUDA 后端**：`export NVDIFRAST_BACKEND=cuda`（无需 EGL 头）。
+
+### 2) 安装 `tetra_triangulation` 的系统依赖（Delaunay 三角剖分）
+
+原项目用 **conda** 安装系统级 C/C++ 依赖（cmake/gmp/cgal）。由于我们用 **uv** 只管 Python 包，需要通过 **apt**（系统包管理器）安装这些 C/C++ 库：
+
+```bash
+# 用 apt 安装 C/C++ 依赖（Ubuntu 24.04）
+sudo apt update
+sudo apt install -y \
+  build-essential \
+  cmake ninja-build \
+  libgmp-dev libmpfr-dev libcgal-dev \
+  libboost-all-dev
+
+# （可选）可能用到：
+# sudo apt install -y libeigen3-dev
+```
+
+**说明：**
+- `libcgal-dev` 提供 CGAL 头文件（Ubuntu 24.04 上主要是 header-only）
+- `libgmp-dev` 和 `libmpfr-dev` 是 CGAL 的数值后端
+- **uv 仅负责 Python 侧依赖**；像 CGAL/GMP/MPFR 这种 C/C++ 依赖必须走系统包管理器（apt、brew、pacman）
+- **macOS**：`brew install cmake cgal gmp mpfr boost`
+- **Arch Linux**：`sudo pacman -S cgal gmp mpfr boost cmake base-devel`
+
+### 3) 编译 `tetra_triangulation` 并对齐 ABI
+
+> **重要：** 该模块需要与 PyTorch 2.7.1（C++11 ABI=1）对齐 ABI。我们使用头文件方式来强制这一点。
+
+**a) 创建 ABI 强制头文件：**
+
+创建 `submodules/tetra_triangulation/src/force_abi.h`：
+```cpp
+#pragma once
+// 在任何 STL 头之前强制新 ABI
+#if defined(_GLIBCXX_USE_CXX11_ABI)
+#  undef _GLIBCXX_USE_CXX11_ABI
+#endif
+#define _GLIBCXX_USE_CXX11_ABI 1
+```
+
+**b) 修改源文件：**
+
+在以下文件的**第一行**加入 `#include "force_abi.h"`：
+- `submodules/tetra_triangulation/src/py_binding.cpp`
+- `submodules/tetra_triangulation/src/triangulation.cpp`
+
+**c) 构建与安装：**
+
+```bash
+cd submodules/tetra_triangulation
+rm -rf build CMakeCache.txt CMakeFiles tetranerf/utils/extension/tetranerf_cpp_extension*.so
+
+# 指向当前 PyTorch 的 CMake 前缀/动态库路径
+export CMAKE_PREFIX_PATH="$(python - <<'PY'
+import torch; print(torch.utils.cmake_prefix_path)
+PY
+)"
+export TORCH_LIB_DIR="$(python - <<'PY'
+import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))
+PY
+)"
+export LD_LIBRARY_PATH="$TORCH_LIB_DIR:$LD_LIBRARY_PATH"
+
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" .
+cmake --build . -j"$(nproc)"
+
+# 安装（可选，便于可编辑引用）
+uv pip install -e .
+cd ../../
+```
+
+> **说明：** 如需排查 ABI 问题，请参阅下方**关键问题 1**部分。
 
 ---
 
@@ -59,9 +133,9 @@ undefined symbol: _ZN3c106detail14torchCheckFailEPKcS2_jRKSs
 尾部 `RKSs` 表示 **老 ABI（_GLIBCXX_USE_CXX11_ABI=0）**，而我们的 PyTorch 2.7.1 使用 **新 ABI（=1）**。
 
 **修复**
-在 `submodules/tetra_triangulation` 中加入强制 ABI 的头文件，并在 CMake 上再加一层保险，**稳定锁定 ABI=1**：
+在 `submodules/tetra_triangulation` 中加入强制 ABI 的头文件，**稳定锁定 ABI=1**：
 
-* 新增：`src/force_abi.h`
+* 创建文件：`src/force_abi.h`
 
   ```cpp
   #pragma once
@@ -72,25 +146,13 @@ undefined symbol: _ZN3c106detail14torchCheckFailEPKcS2_jRKSs
   #define _GLIBCXX_USE_CXX11_ABI 1
   ```
 
-* 修改：`src/py_binding.cpp` 与 `src/triangulation.cpp` 的第一行加入
+* 修改：在 `src/py_binding.cpp` 与 `src/triangulation.cpp` 的**第一行**加入
 
   ```cpp
   #include "force_abi.h"
   ```
 
-* 在 `CMakeLists.txt` 的 `add_library(tetranerf_cpp_extension ...)` 之后加入（从 PyTorch 读取 ABI 并加到目标上）：
-
-  ```cmake
-  execute_process(
-    COMMAND ${PYTHON_EXECUTABLE} - <<PY
-  import torch, sys
-  sys.stdout.write(str(int(torch._C._GLIBCXX_USE_CXX11_ABI)))
-  PY
-    OUTPUT_VARIABLE TORCH_ABI
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-  message(STATUS "Forcing _GLIBCXX_USE_CXX11_ABI=${TORCH_ABI} for tetranerf_cpp_extension")
-  target_compile_definitions(tetranerf_cpp_extension PRIVATE _GLIBCXX_USE_CXX11_ABI=${TORCH_ABI})
-  ```
+> **说明：** 使用这种头文件方式即可强制 ABI=1，无需额外修改 CMakeLists.txt。
 
 **构建命令（就地 in-source，产物落到包路径）**
 
@@ -371,8 +433,7 @@ python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply \
 
 1. **`submodules/tetra_triangulation`**
 
-   * 新增 `src/force_abi.h`，并在两个源文件首行 `#include "force_abi.h"`：**强制使用 C++11 新 ABI (=1)**
-   * 在 `CMakeLists.txt` 对目标 `tetranerf_cpp_extension` 增加 `target_compile_definitions(_GLIBCXX_USE_CXX11_ABI=${TORCH_ABI})`（从当前 PyTorch 读取）
+   * 新增 `src/force_abi.h`，并在 `src/py_binding.cpp` 和 `src/triangulation.cpp` 首行 `#include "force_abi.h"`：**强制使用 C++11 新 ABI (=1)**
 
 2. **`milo/scene/mesh.py`**
 
@@ -421,8 +482,3 @@ python clean_convert_mesh.py --in ./output/Ignatius/mesh_learnable_sdf.ply \
 ## 许可与鸣谢
 
 本仓库为对原始 MILo 项目在 **CUDA 12.8 / RTX 50** 环境下的适配与工程化补充，保留原始项目许可证与归属。感谢原作者与各子模块作者（Tetra-NeRF、nvdiffrast、3D Gaussian Splatting 等）的优秀工作。
-
-```
-
-::contentReference[oaicite:0]{index=0}
-```
