@@ -456,6 +456,25 @@ def compute_mesh_regularization(
 
         # --- Build and Render Mesh ---
         mesh = Meshes(verts=verts, faces=faces[faces_mask])
+        mesh_triangles = mesh.faces
+        if mesh_triangles.numel() == 0:
+            mesh_state["mesh_triangles"] = mesh_triangles
+            return {
+                "mesh_loss": torch.zeros((), device=gaussians._xyz.device),
+                "mesh_depth_loss": torch.zeros((), device=gaussians._xyz.device),
+                "mesh_normal_loss": torch.zeros((), device=gaussians._xyz.device),
+                "occupied_centers_loss": torch.zeros((), device=gaussians._xyz.device),
+                "occupancy_labels_loss": torch.zeros((), device=gaussians._xyz.device),
+                "updated_state": mesh_state,
+                "mesh_render_pkg": {
+                    "depth": torch.zeros_like(render_pkg.get("median_depth", torch.zeros(1, device=gaussians._xyz.device))),
+                    "normals": torch.zeros_like(render_pkg.get("normal", torch.zeros_like(render_pkg.get("render", torch.zeros(gaussians._xyz.shape[0], device=gaussians._xyz.device)))))
+                },
+                "voronoi_points_count": voronoi_points_count,
+                "mesh_triangles": mesh_triangles,
+            }
+
+        mesh_state["mesh_triangles"] = mesh_triangles
 
         mesh_render_pkg = mesh_renderer(
             mesh,
@@ -489,7 +508,7 @@ def compute_mesh_regularization(
             voronoi_occupancy_labels, _ = evaluate_mesh_occupancy(
                 points=voronoi_points,
                 views=scene.getTrainCameras().copy(),
-                mesh=Meshes(verts=verts, faces=faces),
+                mesh=mesh,
                 masks=None,
                 return_colors=True,
                 use_scalable_renderer=config["use_scalable_renderer"],

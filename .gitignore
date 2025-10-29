@@ -207,3 +207,9 @@ dmypy.json
 # Pyre type checker
 .pyre/
 learnableearthparser/fast_sampler/_sampler.c
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/.gitignore
+/.idea/MILo_rtx50.iml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/vcs.xml

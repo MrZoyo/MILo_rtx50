@@ -208,6 +208,9 @@ def training(
                 culling=gaussians._culling[:,viewpoint_cam.uid],
             )
 
+        if "area_max" not in render_pkg:
+            render_pkg["area_max"] = torch.zeros_like(render_pkg["radii"])
+
         # ---Compute losses---
         image, viewspace_point_tensor, visibility_filter, radii = (
             render_pkg["render"], render_pkg["viewspace_points"], 
