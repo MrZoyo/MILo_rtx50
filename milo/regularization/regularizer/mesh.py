@@ -76,6 +76,9 @@ def initialize_mesh_regularization(
         "surface_delaunay_xyz_idx": None,
         "reset_delaunay_samples": True,
         "reset_sdf_values": True,
+        "surface_sample_export_path": None,
+        "surface_sample_saved": False,
+        "surface_sample_saved_iter": None,
     }
 
     return mesh_renderer, mesh_state
@@ -242,6 +245,7 @@ def compute_mesh_regularization(
 
                 if downsample_gaussians_for_delaunay:
                     print(f"[INFO] Downsampling Delaunay Gaussians from {n_gaussians_to_sample_from} to {n_max_gaussians_for_delaunay}.")                        
+                    surface_indices_for_export = None
                     if config["delaunay_sampling_method"] == "random":
                         delaunay_xyz_idx = torch.randperm(
                             n_gaussians_to_sample_from, device="cuda"
@@ -257,6 +261,7 @@ def compute_mesh_regularization(
                             n_samples=n_max_gaussians_for_delaunay,
                             sampling_mask=delaunay_sampling_radius_mask,
                         )
+                        surface_indices_for_export = delaunay_xyz_idx
                     elif config["delaunay_sampling_method"] == "surface+opacity":
                         delaunay_xyz_idx = gaussians.sample_surface_gaussians(
                             scene=scene,
@@ -268,9 +273,10 @@ def compute_mesh_regularization(
                             n_samples=n_max_gaussians_for_delaunay,
                             sampling_mask=delaunay_sampling_radius_mask,
                         )
+                        surface_indices_for_export = delaunay_xyz_idx.clone()
                         n_remaining_gaussians_to_sample = n_max_gaussians_for_delaunay - delaunay_xyz_idx.shape[0]
                         if n_remaining_gaussians_to_sample > 0:
-                            mesh_state["surface_delaunay_xyz_idx"] = delaunay_xyz_idx.clone()
+                            mesh_state["surface_delaunay_xyz_idx"] = surface_indices_for_export.clone()
                             opacity_sample_mask = torch.ones(gaussians._xyz.shape[0], device="cuda", dtype=torch.bool)
                             opacity_sample_mask[delaunay_xyz_idx] = False
                             delaunay_xyz_idx = torch.cat(
@@ -286,6 +292,19 @@ def compute_mesh_regularization(
                             delaunay_xyz_idx = torch.sort(delaunay_xyz_idx, dim=0)[0]
                     else:
                         raise ValueError(f"Invalid Delaunay sampling method: {config['delaunay_sampling_method']}")
+
+                    if (
+                        surface_indices_for_export is not None
+                        and surface_indices_for_export.numel() > 0
+                        and mesh_state.get("surface_sample_export_path")
+                        and not mesh_state.get("surface_sample_saved", False)
+                    ):
+                        export_path = mesh_state["surface_sample_export_path"]
+                        gaussians.save_subset_ply(export_path, surface_indices_for_export)
+                        mesh_state["surface_sample_saved"] = True
+                        mesh_state["surface_sample_saved_iter"] = iteration
+                        print(f"[INFO] Exported initial surface Gaussians ({surface_indices_for_export.numel()} points) to {export_path}.")
+
                     print(f"[INFO] Downsampled Delaunay Gaussians from {n_gaussians_to_sample_from} to {len(delaunay_xyz_idx)}.")
                     reset_occupancy_labels_for_new_delaunay_sites = True
                 else:

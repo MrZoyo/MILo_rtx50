@@ -91,8 +91,25 @@ def load_cameras_from_json(
 
     cameras: List[Camera] = []
     for idx, entry in enumerate(camera_entries):
-        rotation = quaternion_to_rotation_matrix(entry["quaternion"])
+        if "quaternion" in entry:
+            rotation = quaternion_to_rotation_matrix(entry["quaternion"])
+        elif "rotation" in entry:
+            rotation = np.asarray(entry["rotation"], dtype=np.float32)
+            if rotation.shape != (3, 3):
+                raise ValueError(f"Camera entry {idx} rotation must be 3x3, got {rotation.shape}")
+        else:
+            raise KeyError(f"Camera entry {idx} must provide either 'quaternion' or 'rotation'.")
+
+        if "position" not in entry:
+            raise KeyError(f"Camera entry {idx} missing 'position'.")
         translation = np.asarray(entry["position"], dtype=np.float32)
+
+        image_name = (
+            entry.get("name")
+            or entry.get("img_name")
+            or entry.get("image_name")
+            or f"view_{idx:04d}"
+        )
         camera = Camera(
             colmap_id=str(idx),
             R=rotation,
@@ -101,7 +118,7 @@ def load_cameras_from_json(
             FoVy=fov_y,
             image=torch.zeros(3, image_height, image_width),
             gt_alpha_mask=None,
-            image_name=entry.get("name", f"view_{idx:04d}"),
+            image_name=image_name,
             uid=idx,
             data_device="cuda",
         )

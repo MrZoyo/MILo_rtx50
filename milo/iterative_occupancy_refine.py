@@ -2,6 +2,7 @@
 """Iteratively refine learnable occupancy (SDF) while keeping Gaussian geometry fixed."""
 
 import argparse
+import json
 import os
 import random
 from types import SimpleNamespace
@@ -38,6 +39,23 @@ def ensure_learnable_occupancy(gaussians: GaussianModel) -> None:
         gaussians._occupancy_shift = torch.nn.Parameter(shift.requires_grad_(True))
     gaussians.set_occupancy_mode("occupancy_shift")
     gaussians._occupancy_shift.requires_grad_(True)
+
+
+def extract_loss_scalars(metrics: dict) -> dict:
+    """Extract scalar loss values from the mesh regularization outputs."""
+    scalars = {}
+    for key, value in metrics.items():
+        if not key.endswith("_loss"):
+            continue
+        scalar = None
+        if isinstance(value, torch.Tensor):
+            if value.ndim == 0:
+                scalar = float(value.item())
+        elif isinstance(value, (float, int)):
+            scalar = float(value)
+        if scalar is not None:
+            scalars[key] = scalar
+    return scalars
 
 
 def export_iteration_state(
@@ -107,6 +125,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Frustum cull meshes using the first camera before export.",
     )
+    parser.add_argument(
+        "--sdf_log_samples",
+        type=int,
+        default=32,
+        help="Number of SDF values recorded per iteration (0 disables sampling).",
+    )
+    parser.add_argument(
+        "--loss_log_filename",
+        type=str,
+        default="losses.jsonl",
+        help="Filename used for per-iteration loss logs.",
+    )
+    parser.add_argument(
+        "--sdf_log_filename",
+        type=str,
+        default="sdf_samples.jsonl",
+        help="Filename used for per-iteration SDF sample logs.",
+    )
+    parser.add_argument(
+        "--surface_gaussians_filename",
+        type=str,
+        default="surface_gaussians_initial.ply",
+        help="Filename for the first batch of surface Gaussians (empty string disables export).",
+    )
     return parser
 
 
@@ -166,6 +208,13 @@ def main() -> None:
     mesh_renderer, mesh_state = initialize_mesh_regularization(scene, mesh_config)
     mesh_state["reset_delaunay_samples"] = True
     mesh_state["reset_sdf_values"] = True
+    surface_gaussians_path = None
+    if args.surface_gaussians_filename:
+        surface_gaussians_path = os.path.join(args.output_dir, args.surface_gaussians_filename)
+        print(f"[INFO] Will export first sampled surface Gaussians to {surface_gaussians_path}.")
+    mesh_state["surface_sample_export_path"] = surface_gaussians_path
+    mesh_state["surface_sample_saved"] = False
+    mesh_state["surface_sample_saved_iter"] = None
 
     runtime_args = SimpleNamespace(
         warn_until_iter=args.warn_until_iter,
@@ -174,89 +223,175 @@ def main() -> None:
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
+    log_dir = os.path.join(args.output_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    loss_log_path = os.path.join(log_dir, args.loss_log_filename)
+    sdf_log_path = os.path.join(log_dir, args.sdf_log_filename)
 
     ema_loss = None
     pending_view_indices: list[int] = []
+    sdf_sample_indices_tensor = None  # Stored on the same device as pivots_sdf_flat
+    sdf_sample_indices_list = None
 
-    # Iterate through all cameras without replacement; reshuffle when one pass finishes.
-    for iteration in range(1, args.iterations + 1):
-        if not pending_view_indices:
-            pending_view_indices = list(range(len(cameras)))
-            random.shuffle(pending_view_indices)
+    with open(loss_log_path, "w", encoding="utf-8") as loss_log_file, open(
+        sdf_log_path, "w", encoding="utf-8"
+    ) as sdf_log_file:
+        # Iterate through all cameras without replacement; reshuffle when one pass finishes.
+        for iteration in range(1, args.iterations + 1):
+            if not pending_view_indices:
+                pending_view_indices = list(range(len(cameras)))
+                random.shuffle(pending_view_indices)
 
-        view_idx = pending_view_indices.pop()
-        viewpoint = cameras[view_idx]
+            view_idx = pending_view_indices.pop()
+            viewpoint = cameras[view_idx]
 
-        render_pkg = render_view(viewpoint)
+            render_pkg = render_view(viewpoint)
 
-        mesh_pkg = compute_mesh_regularization(
-            iteration=iteration,
-            render_pkg=render_pkg,
-            viewpoint_cam=viewpoint,
-            viewpoint_idx=view_idx,
-            gaussians=gaussians,
-            scene=scene,
-            pipe=pipe,
-            background=background,
-            kernel_size=0.0,
-            config=mesh_config,
-            mesh_renderer=mesh_renderer,
-            mesh_state=mesh_state,
-            render_func=render_for_sdf,
-            weight_adjustment=100.0 / max(args.iterations, 1),
-            args=runtime_args,
-            integrate_func=integrate_radegs,
-        )
-        mesh_state = mesh_pkg["updated_state"]
-
-        if mesh_pkg.get("mesh_triangles") is not None and mesh_pkg["mesh_triangles"].numel() == 0:
-            print(f"[WARNING] Empty mesh at iteration {iteration}; skipping optimizer step.")
-            continue
-
-        raw_mesh_loss = mesh_pkg["mesh_loss"]
-        loss = args.mesh_loss_weight * raw_mesh_loss
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-
-        loss_value = float(loss.item())
-        raw_loss_value = float(raw_mesh_loss.item())
-        ema_loss = loss_value if ema_loss is None else (0.9 * ema_loss + 0.1 * loss_value)
-
-        if iteration % args.log_interval == 0 or iteration == 1:
-            mesh_depth = mesh_pkg["mesh_depth_loss"].item()
-            mesh_normal = mesh_pkg["mesh_normal_loss"].item()
-            occupied_centers = mesh_pkg["occupied_centers_loss"].item()
-            occupancy_labels = mesh_pkg["occupancy_labels_loss"].item()
-
-            current_occ = torch.sigmoid(gaussians._base_occupancy + gaussians._occupancy_shift)
-            pivots_sdf = convert_occupancy_to_sdf(flatten_voronoi_features(current_occ))
-            sdf_mean = float(pivots_sdf.mean().item())
-
-            print(
-                "[Iter {iter:05d}] loss={loss:.6f} ema={ema:.6f} depth={depth:.6f} "
-                "normal={normal:.6f} occ_centers={centers:.6f} labels={labels:.6f} "
-                "sdf_mean={sdf_mean:.6f} mesh_raw={raw_mesh:.6f}".format(
-                    iter=iteration,
-                    loss=loss_value,
-                    ema=ema_loss,
-                    depth=mesh_depth,
-                    normal=mesh_normal,
-                    centers=occupied_centers,
-                    labels=occupancy_labels,
-                    sdf_mean=sdf_mean,
-                    raw_mesh=raw_loss_value,
-                )
-            )
-
-        if args.export_interval > 0 and iteration % args.export_interval == 0:
-            export_iteration_state(
+            mesh_pkg = compute_mesh_regularization(
                 iteration=iteration,
+                render_pkg=render_pkg,
+                viewpoint_cam=viewpoint,
+                viewpoint_idx=view_idx,
                 gaussians=gaussians,
+                scene=scene,
+                pipe=pipe,
+                background=background,
+                kernel_size=0.0,
+                config=mesh_config,
+                mesh_renderer=mesh_renderer,
                 mesh_state=mesh_state,
-                output_dir=args.output_dir,
-                reference_camera=cameras[0] if args.cull_on_export else None,
+                render_func=render_for_sdf,
+                weight_adjustment=100.0 / max(args.iterations, 1),
+                args=runtime_args,
+                integrate_func=integrate_radegs,
             )
+            mesh_state = mesh_pkg["updated_state"]
+
+            with torch.no_grad():
+                current_occ = torch.sigmoid(gaussians._base_occupancy + gaussians._occupancy_shift)
+                pivots_sdf = convert_occupancy_to_sdf(flatten_voronoi_features(current_occ))
+                pivots_sdf_flat = pivots_sdf.view(-1).detach()
+                if pivots_sdf_flat.numel() > 0:
+                    sdf_mean = float(pivots_sdf_flat.mean().item())
+                    sdf_std = float(pivots_sdf_flat.std(unbiased=False).item())
+                else:
+                    sdf_mean = 0.0
+                    sdf_std = 0.0
+
+                sample_indices_list = []
+                sample_values_list = []
+                if args.sdf_log_samples > 0 and pivots_sdf_flat.numel() > 0:
+                    sample_count = min(args.sdf_log_samples, pivots_sdf_flat.numel())
+                    need_refresh = sdf_sample_indices_tensor is None or sdf_sample_indices_tensor.numel() != sample_count
+                    if not need_refresh:
+                        max_index = int(sdf_sample_indices_tensor.max().item())
+                        need_refresh = max_index >= pivots_sdf_flat.numel()
+                    if need_refresh:
+                        # Draw once so the same subset of pivots is tracked across iterations.
+                        sdf_sample_indices_tensor = torch.randperm(
+                            pivots_sdf_flat.shape[0], device=pivots_sdf_flat.device
+                        )[:sample_count]
+                        sdf_sample_indices_list = sdf_sample_indices_tensor.detach().cpu().tolist()
+                    else:
+                        if sdf_sample_indices_tensor.device != pivots_sdf_flat.device:
+                            sdf_sample_indices_tensor = sdf_sample_indices_tensor.to(
+                                pivots_sdf_flat.device, non_blocking=True
+                            )
+                    sample_values = pivots_sdf_flat[sdf_sample_indices_tensor]
+                    sample_indices_list = sdf_sample_indices_list or []
+                    sample_values_list = sample_values.cpu().tolist()
+
+            raw_mesh_loss = mesh_pkg["mesh_loss"]
+            loss = args.mesh_loss_weight * raw_mesh_loss
+            loss_value = float(loss.item())
+            raw_loss_value = float(raw_mesh_loss.item())
+
+            loss_scalars = extract_loss_scalars(mesh_pkg)
+            skip_iteration = (
+                mesh_pkg.get("mesh_triangles") is not None and mesh_pkg["mesh_triangles"].numel() == 0
+            )
+
+            iteration_record = {
+                "iteration": iteration,
+                "view_index": view_idx,
+                "total_loss": loss_value,
+                "raw_mesh_loss": raw_loss_value,
+                "sdf_mean": sdf_mean,
+                "sdf_std": sdf_std,
+                "skipped": bool(skip_iteration),
+            }
+            if ema_loss is not None:
+                iteration_record["ema_loss"] = ema_loss
+            iteration_record.update(loss_scalars)
+
+            sdf_record = {
+                "iteration": iteration,
+                "sdf_mean": sdf_mean,
+                "sdf_std": sdf_std,
+                "sample_count": len(sample_values_list),
+                "sample_indices": sample_indices_list,
+                "sample_values": sample_values_list,
+            }
+
+            if skip_iteration:
+                iteration_record["skipped_reason"] = "empty_mesh"
+                loss_log_file.write(json.dumps(iteration_record) + "\n")
+                loss_log_file.flush()
+                sdf_record["skipped"] = True
+                sdf_log_file.write(json.dumps(sdf_record) + "\n")
+                sdf_log_file.flush()
+                print(f"[WARNING] Empty mesh at iteration {iteration}; skipping optimizer step.")
+                continue
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            ema_loss = loss_value if ema_loss is None else (0.9 * ema_loss + 0.1 * loss_value)
+            iteration_record["ema_loss"] = ema_loss
+
+            loss_log_file.write(json.dumps(iteration_record) + "\n")
+            loss_log_file.flush()
+
+            sdf_log_file.write(json.dumps(sdf_record) + "\n")
+            sdf_log_file.flush()
+
+            if iteration % args.log_interval == 0 or iteration == 1:
+                mesh_depth = loss_scalars.get("mesh_depth_loss", 0.0)
+                mesh_normal = loss_scalars.get("mesh_normal_loss", 0.0)
+                occupied_centers = loss_scalars.get("occupied_centers_loss", 0.0)
+                occupancy_labels = loss_scalars.get("occupancy_labels_loss", 0.0)
+
+                print(
+                    "[Iter {iter:05d}] loss={loss:.6f} ema={ema:.6f} depth={depth:.6f} "
+                    "normal={normal:.6f} occ_centers={centers:.6f} labels={labels:.6f} "
+                    "sdf_mean={sdf_mean:.6f} mesh_raw={raw_mesh:.6f}".format(
+                        iter=iteration,
+                        loss=loss_value,
+                        ema=ema_loss,
+                        depth=mesh_depth,
+                        normal=mesh_normal,
+                        centers=occupied_centers,
+                        labels=occupancy_labels,
+                        sdf_mean=sdf_mean,
+                        raw_mesh=raw_loss_value,
+                    )
+                )
+
+            if args.export_interval > 0 and iteration % args.export_interval == 0:
+                export_iteration_state(
+                    iteration=iteration,
+                    gaussians=gaussians,
+                    mesh_state=mesh_state,
+                    output_dir=args.output_dir,
+                    reference_camera=cameras[0] if args.cull_on_export else None,
+                )
+
+    if surface_gaussians_path and not mesh_state.get("surface_sample_saved", False):
+        print(
+            "[WARNING] Requested export of surface Gaussians but no samples were saved. "
+            "Verify surface sampling settings."
+        )
 
     final_dir = os.path.join(args.output_dir, "final")
     os.makedirs(final_dir, exist_ok=True)
