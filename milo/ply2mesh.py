@@ -100,9 +100,23 @@ def load_cameras_from_json(
         else:
             raise KeyError(f"Camera entry {idx} must provide either 'quaternion' or 'rotation'.")
 
-        if "position" not in entry:
-            raise KeyError(f"Camera entry {idx} missing 'position'.")
-        translation = np.asarray(entry["position"], dtype=np.float32)
+        translation = None
+        if "tvec" in entry:
+            translation = np.asarray(entry["tvec"], dtype=np.float32)
+        elif "translation" in entry:
+            translation = np.asarray(entry["translation"], dtype=np.float32)
+        elif "position" in entry:
+            camera_center = np.asarray(entry["position"], dtype=np.float32)
+            if camera_center.shape != (3,):
+                raise ValueError(f"Camera entry {idx} position must be length-3, got shape {camera_center.shape}")
+            # Camera expects world-to-view translation (COLMAP convention t = -R * C).
+            rotation_w2c = rotation.T  # rotation is camera-to-world
+            translation = -rotation_w2c @ camera_center
+        else:
+            raise KeyError(f"Camera entry {idx} must provide 'position', 'translation', or 'tvec'.")
+
+        if translation.shape != (3,):
+            raise ValueError(f"Camera entry {idx} translation must be length-3, got shape {translation.shape}")
 
         image_name = (
             entry.get("name")

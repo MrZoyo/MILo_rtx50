@@ -16,7 +16,7 @@ use_depth_normal: true
 
 # Delaunay computation
 delaunay_reset_interval: 500
-n_max_points_in_delaunay: 2_400_000
+n_max_points_in_delaunay: 1_800_000
 delaunay_sampling_method: "surface"
 filter_large_edges: true
 collapse_large_edges: false

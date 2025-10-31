@@ -1358,7 +1358,7 @@ class GaussianModel:
         self.factor_culling=count_vis/(count_rad+1e-1)
 
         non_prune_mask = init_cdf_mask(importance=imp_score, thres=0.999) 
-        prune_mask = (count_vis<=1)[:,0]
+        prune_mask = (count_vis==0)[:,0]
         prune_mask = torch.logical_or(prune_mask, non_prune_mask==False)
         self.prune_points(prune_mask) 
 
