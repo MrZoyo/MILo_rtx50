@@ -1141,9 +1141,6 @@ class GaussianModel:
         self._culling=torch.zeros((self._xyz.shape[0], num_views), dtype=torch.bool, device='cuda')
         self.factor_culling=torch.ones((self._xyz.shape[0],1), device='cuda')
 
-
-
-
     def depth_reinit(self, scene, render_depth, iteration, num_depth, args, pipe, background):
 
         out_pts_list=[]

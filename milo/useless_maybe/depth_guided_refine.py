@@ -22,8 +22,7 @@ import torch.nn.functional as F
 
 from arguments import OptimizationParams, PipelineParams
 from gaussian_renderer import integrate_radegs
-from scene.gaussian_model import SparseGaussianAdam
-from ply2mesh import (
+from milo.useless_maybe.ply2mesh import (
     ManualScene,
     export_mesh_from_gaussians,
     initialize_mesh_regularization,
@@ -584,7 +583,7 @@ def load_mesh_config(
     stop_iter_override: Optional[int] = None,
     total_iterations: Optional[int] = None,
 ) -> Dict:
-    from ply2mesh import load_mesh_config_file
+    from milo.useless_maybe.ply2mesh import load_mesh_config_file
 
     config = load_mesh_config_file(name)
     if start_iter_override is not None:

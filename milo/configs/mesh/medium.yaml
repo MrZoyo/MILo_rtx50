@@ -16,7 +16,7 @@ use_depth_normal: true
 
 # Delaunay computation
 delaunay_reset_interval: 500
-n_max_points_in_delaunay: 1_800_000
+n_max_points_in_delaunay: 1_200_000
 delaunay_sampling_method: "surface"
 filter_large_edges: true
 collapse_large_edges: false
@@ -47,7 +47,7 @@ use_occupancy_labels_loss: true
 reset_occupancy_labels_every: 200
 occupancy_labels_loss_weight: 0.005
 #       > SDF reset
-fix_set_of_learnable_sdfs: false
+fix_set_of_learnable_sdfs: true
 learnable_sdf_reset_mode: "ema"
 learnable_sdf_reset_stop_iter: 13_001
 learnable_sdf_reset_alpha_ema: 0.4
