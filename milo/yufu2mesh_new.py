@@ -24,6 +24,10 @@ from scene.mesh import MeshRasterizer, MeshRenderer
 from gaussian_renderer.radegs import render_radegs
 from arguments import PipelineParams
 
+# DISCOVER-SE 相机轨迹使用 OpenGL 右手坐标系（相机前方为 -Z，向上为 +Y），
+# 而 MILo/colmap 渲染管线假设的是前方 +Z、向上 -Y。需要在读入时做一次轴翻转。
+OPENGL_TO_COLMAP = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+
 
 def quaternion_to_rotation_matrix(quaternion: Sequence[float]) -> np.ndarray:
     """将单位四元数转换为 3x3 旋转矩阵。"""
@@ -90,6 +94,18 @@ def prepare_normals(normal_tensor: torch.Tensor) -> np.ndarray:
     return normals_np
 
 
+def normals_to_rgb(normals: np.ndarray) -> np.ndarray:
+    """将 [-1,1] 范围的法线向量映射到 [0,1] 以便可视化。"""
+    normals = np.nan_to_num(normals, nan=0.0, posinf=0.0, neginf=0.0)
+    rgb = 0.5 * (normals + 1.0)
+    return np.clip(rgb, 0.0, 1.0).astype(np.float32)
+
+
+def save_normal_visualization(normal_rgb: np.ndarray, output_path: Path) -> None:
+    """保存法线可视化图像。"""
+    plt.imsave(output_path, normal_rgb)
+
+
 def load_cameras_from_json(
     json_path: str,
     image_height: int,
@@ -132,6 +148,11 @@ def load_cameras_from_json(
         if rotation_c2w.shape != (3, 3):
             raise ValueError(f"相机条目 {idx} 的旋转矩阵形状应为 (3,3)，实际为 {rotation_c2w.shape}")
 
+        # DISCOVER-SE 的 quaternion/rotation 直接导入后，渲染出来的 PNG 会上下翻转，
+        # 说明其前进方向仍是 OpenGL 的 -Z。通过右乘 diag(1,-1,-1) 将其显式转换到
+        # MILo/colmap 的坐标系，使得后续投影矩阵与深度图一致。
+        rotation_c2w = rotation_c2w @ OPENGL_TO_COLMAP
+
         if "position" in entry:
             camera_center = np.asarray(entry["position"], dtype=np.float32)
             if camera_center.shape != (3,):
@@ -140,6 +161,9 @@ def load_cameras_from_json(
             translation = (-rotation_w2c @ camera_center).astype(np.float32)
         elif "translation" in entry:
             translation = np.asarray(entry["translation"], dtype=np.float32)
+            # 如果 JSON 已直接存储 colmap 风格的 T（即世界到相机），这里假设它与旋转
+            # 一样来自 OpenGL 坐标。严格来说也应执行同样的轴变换，但现有数据集只有
+            # position 字段；为避免重复转换，这里只做类型检查并保留原值。
         elif "tvec" in entry:
             translation = np.asarray(entry["tvec"], dtype=np.float32)
         else:
@@ -364,6 +388,7 @@ def main():
                 return_depth=True,
                 return_normals=True,
             )
+            ply_render_pkg = render_func(train_cameras[view_index])
 
         loss_tensor = compute_gaussian_mesh_loss(refined_mesh.verts, means[surface_gaussians_idx], max_samples=args.max_loss_samples)
         loss_value = float(loss_tensor.item())
@@ -374,9 +399,100 @@ def main():
 
         depth_map = prepare_depth_map(mesh_render_pkg["depth"])
         normals_map = prepare_normals(mesh_render_pkg["normals"])
+        ply_depth_map = prepare_depth_map(ply_render_pkg["depth"])
+
+        mesh_valid = np.isfinite(depth_map) & (depth_map > 0.0)
+        ply_valid = np.isfinite(ply_depth_map) & (ply_depth_map > 0.0)
+        valid_values: List[np.ndarray] = []
+        if mesh_valid.any():
+            valid_values.append(depth_map[mesh_valid].reshape(-1))
+        if ply_valid.any():
+            valid_values.append(ply_depth_map[ply_valid].reshape(-1))
+        if valid_values:
+            all_valid = np.concatenate(valid_values)
+            shared_min = float(all_valid.min())
+            shared_max = float(all_valid.max())
+        else:
+            shared_min, shared_max = 0.0, 1.0
+
+        ply_depth_vis_path = output_dir / f"ply_depth_vis_iter_{iteration:02d}.png"
+        plt.imsave(ply_depth_vis_path, ply_depth_map, cmap="viridis", vmin=shared_min, vmax=shared_max)
+
+        # 深度值直接是世界坐标下的视线距离，存成伪彩色图便于快速确认视角/遮挡。
+        depth_vis_path = output_dir / f"depth_vis_iter_{iteration:02d}.png"
+        plt.imsave(depth_vis_path, depth_map, cmap="viridis", vmin=shared_min, vmax=shared_max)
+
+        normal_vis_path = output_dir / f"normal_vis_iter_{iteration:02d}.png"
+        normals_rgb = normals_to_rgb(normals_map)
+        save_normal_visualization(normals_rgb, normal_vis_path)
 
         output_npz = output_dir / f"mesh_render_iter_{iteration:02d}.npz"
-        np.savez(output_npz, depth=depth_map, normals=normals_map, loss=loss_value, moving_loss=moving_loss)
+        np.savez(
+            output_npz,
+            depth=depth_map,
+            ply_depth=ply_depth_map,
+            normals=normals_map,
+            normal_vis=normals_rgb,
+            loss=loss_value,
+            moving_loss=moving_loss,
+        )
+
+        overlap_mask = mesh_valid & ply_valid
+        if overlap_mask.any():
+            depth_delta = depth_map - ply_depth_map
+            delta_abs = np.abs(depth_delta[overlap_mask])
+            diff_mean = float(delta_abs.mean())
+            diff_max = float(delta_abs.max())
+            diff_rmse = float(np.sqrt(np.mean(depth_delta[overlap_mask] ** 2)))
+        else:
+            diff_mean = diff_max = diff_rmse = float("nan")
+
+        composite_path = output_dir / f"comparison_iter_{iteration:02d}.png"
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10), dpi=300)
+
+        im0 = axes[0, 0].imshow(ply_depth_map, cmap="viridis", vmin=shared_min, vmax=shared_max)
+        axes[0, 0].set_title("PLY Depth (RaDe-GS)")
+        axes[0, 0].axis("off")
+        fig.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+
+        im1 = axes[0, 1].imshow(depth_map, cmap="viridis", vmin=shared_min, vmax=shared_max)
+        axes[0, 1].set_title("Mesh Depth")
+        axes[0, 1].axis("off")
+        fig.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+        axes[1, 0].imshow(normals_rgb)
+        axes[1, 0].set_title("Mesh Normals (RGB)")
+        axes[1, 0].axis("off")
+
+        axes[1, 1].axis("off")
+        info_lines = [
+            f"Iteration: {iteration:02d}",
+            f"View index: {view_index}",
+            f"PLY depth valid px: {int(ply_valid.sum())}",
+        ]
+        if ply_valid.any():
+            info_lines.append(
+                f"  min={float(ply_depth_map[ply_valid].min()):.3f}, "
+                f"max={float(ply_depth_map[ply_valid].max()):.3f}, "
+                f"mean={float(ply_depth_map[ply_valid].mean()):.3f}"
+            )
+        info_lines.append(f"Mesh depth valid px: {int(mesh_valid.sum())}")
+        if mesh_valid.any():
+            info_lines.append(
+                f"  min={float(depth_map[mesh_valid].min()):.3f}, "
+                f"max={float(depth_map[mesh_valid].max()):.3f}, "
+                f"mean={float(depth_map[mesh_valid].mean()):.3f}"
+            )
+        if overlap_mask.any():
+            info_lines.append(f"|PLY - Mesh| mean={diff_mean:.3f}, max={diff_max:.3f}, RMSE={diff_rmse:.3f}")
+        else:
+            info_lines.append("No overlapping valid depth pixels.")
+        axes[1, 1].text(0.05, 0.95, "\n".join(info_lines), va="top", fontsize=10)
+
+        fig.suptitle("PLY vs Mesh View Comparison", fontsize=14)
+        fig.tight_layout()
+        fig.savefig(composite_path, dpi=300)
+        plt.close(fig)
 
         if args.lock_view_index is not None:
             # 新增：仅在锁定视角时对比上一帧，避免跨视角差异
