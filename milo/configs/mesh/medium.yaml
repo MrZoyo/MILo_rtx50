@@ -44,7 +44,7 @@ enforce_occupied_centers: true
 occupied_centers_weight: 0.005
 #       > Occupancy labels loss
 use_occupancy_labels_loss: true
-reset_occupancy_labels_every: 200
+reset_occupancy_labels_every: 400
 occupancy_labels_loss_weight: 0.005
 #       > SDF reset
 fix_set_of_learnable_sdfs: true

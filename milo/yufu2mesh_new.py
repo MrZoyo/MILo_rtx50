@@ -2,10 +2,12 @@ from pathlib import Path
 import math
 import json
 import random
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import trimesh
@@ -32,6 +34,197 @@ from utils.geometry_utils import flatten_voronoi_features
 # DISCOVER-SE 相机轨迹使用 OpenGL 右手坐标系（相机前方为 -Z，向上为 +Y），
 # 而 MILo/colmap 渲染管线假设的是前方 +Z、向上 -Y。需要在读入时做一次轴翻转。
 OPENGL_TO_COLMAP = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+
+
+class DepthProvider:
+    """负责加载并缓存 Discoverse 深度图，统一形状、裁剪和掩码。"""
+
+    def __init__(
+        self,
+        depth_root: Path,
+        image_height: int,
+        image_width: int,
+        device: torch.device,
+        clip_min: Optional[float] = None,
+        clip_max: Optional[float] = None,
+    ) -> None:
+        self.depth_root = Path(depth_root)
+        if not self.depth_root.is_dir():
+            raise FileNotFoundError(f"深度目录不存在：{self.depth_root}")
+        self.image_height = image_height
+        self.image_width = image_width
+        self.device = device
+        self.clip_min = clip_min
+        self.clip_max = clip_max
+        self._cache: Dict[int, torch.Tensor] = {}
+        self._mask_cache: Dict[int, torch.Tensor] = {}
+
+    def _file_for_index(self, view_index: int) -> Path:
+        return self.depth_root / f"depth_img_0_{view_index}.npy"
+
+    def _load_numpy(self, file_path: Path) -> np.ndarray:
+        depth_np = np.load(file_path)
+        depth_np = np.squeeze(depth_np)
+        if depth_np.ndim != 2:
+            raise ValueError(f"{file_path} 深度数组维度异常：{depth_np.shape}")
+        if depth_np.shape != (self.image_height, self.image_width):
+            raise ValueError(
+                f"{file_path} 深度分辨率应为 {(self.image_height, self.image_width)}，当前为 {depth_np.shape}"
+            )
+        if self.clip_min is not None or self.clip_max is not None:
+            min_val = self.clip_min if self.clip_min is not None else None
+            max_val = self.clip_max if self.clip_max is not None else None
+            depth_np = np.clip(
+                depth_np,
+                min_val if min_val is not None else depth_np.min(),
+                max_val if max_val is not None else depth_np.max(),
+            )
+        return depth_np.astype(np.float32)
+
+    def get(self, view_index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """返回 (depth_tensor, valid_mask)，均在 GPU 上。"""
+        if view_index not in self._cache:
+            file_path = self._file_for_index(view_index)
+            if not file_path.is_file():
+                raise FileNotFoundError(f"缺少深度文件：{file_path}")
+            depth_np = self._load_numpy(file_path)
+            depth_tensor = torch.from_numpy(depth_np).to(self.device)
+            valid_mask = torch.isfinite(depth_tensor) & (depth_tensor > 0.0)
+            if self.clip_min is not None:
+                valid_mask &= depth_tensor >= self.clip_min
+            if self.clip_max is not None:
+                valid_mask &= depth_tensor <= self.clip_max
+            self._cache[view_index] = depth_tensor
+            self._mask_cache[view_index] = valid_mask
+        return self._cache[view_index], self._mask_cache[view_index]
+
+    def as_numpy(self, view_index: int) -> np.ndarray:
+        depth_tensor, _ = self.get(view_index)
+        return depth_tensor.detach().cpu().numpy()
+
+
+class NormalGroundTruthCache:
+    """缓存以初始高斯生成的法线 GT，避免训练阶段重复渲染。"""
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        image_height: int,
+        image_width: int,
+        device: torch.device,
+    ) -> None:
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.image_height = image_height
+        self.image_width = image_width
+        self.device = device
+        self._memory_cache: Dict[int, torch.Tensor] = {}
+
+    def _file_path(self, view_index: int) -> Path:
+        return self.cache_dir / f"normal_view_{view_index:04d}.npy"
+
+    def has(self, view_index: int) -> bool:
+        return self._file_path(view_index).is_file()
+
+    def store(self, view_index: int, normal_tensor: torch.Tensor) -> None:
+        normals_np = prepare_normals(normal_tensor)
+        np.save(self._file_path(view_index), normals_np.astype(np.float16))
+
+    def get(self, view_index: int) -> torch.Tensor:
+        if view_index not in self._memory_cache:
+            path = self._file_path(view_index)
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"未找到视角 {view_index} 的法线缓存：{path}，请先完成预计算。"
+                )
+            normals_np = np.load(path)
+            expected_shape = (self.image_height, self.image_width, 3)
+            if normals_np.shape != expected_shape:
+                raise ValueError(
+                    f"{path} 法线缓存尺寸应为 {expected_shape}，当前为 {normals_np.shape}"
+                )
+            normals_tensor = (
+                torch.from_numpy(normals_np.astype(np.float32))
+                .permute(2, 0, 1)
+                .to(self.device)
+            )
+            self._memory_cache[view_index] = normals_tensor
+        return self._memory_cache[view_index]
+
+    def clear_memory_cache(self) -> None:
+        self._memory_cache.clear()
+
+    def ensure_all(self, cameras: Sequence[Camera], render_fn) -> None:
+        total = len(cameras)
+        for idx, camera in enumerate(cameras):
+            if self.has(idx):
+                continue
+            with torch.no_grad():
+                pkg = render_fn(camera)
+                normal_tensor = pkg["normal"]
+            self.store(idx, normal_tensor)
+            if (idx + 1) % 10 == 0 or idx + 1 == total:
+                print(f"[INFO] 预计算法线缓存 {idx + 1}/{total}")
+
+
+def compute_depth_loss_tensor(
+    pred_depth: torch.Tensor,
+    gt_depth: torch.Tensor,
+    gt_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """返回深度 L1 损失及统计信息。"""
+    if pred_depth.dim() == 3:
+        pred_depth = pred_depth.squeeze(0)
+    if pred_depth.shape != gt_depth.shape:
+        raise ValueError(
+            f"预测深度尺寸 {pred_depth.shape} 与 GT {gt_depth.shape} 不一致。"
+        )
+    valid_mask = gt_mask & torch.isfinite(pred_depth) & (pred_depth > 0.0)
+    valid_pixels = int(valid_mask.sum().item())
+    if valid_pixels == 0:
+        zero = torch.zeros((), device=pred_depth.device)
+        stats = {"valid_px": 0, "mae": float("nan"), "rmse": float("nan")}
+        return zero, stats
+    diff = pred_depth - gt_depth
+    abs_diff = diff.abs()
+    loss = abs_diff[valid_mask].mean()
+    rmse = torch.sqrt((diff[valid_mask] ** 2).mean())
+    stats = {
+        "valid_px": valid_pixels,
+        "mae": float(abs_diff[valid_mask].mean().detach().item()),
+        "rmse": float(rmse.detach().item()),
+    }
+    return loss, stats
+
+
+def compute_normal_loss_tensor(
+    pred_normals: torch.Tensor,
+    gt_normals: torch.Tensor,
+    base_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """基于余弦相似度的法线损失。"""
+    if pred_normals.dim() != 3 or pred_normals.shape[0] != 3:
+        raise ValueError(f"预测法线维度应为 (3,H,W)，当前为 {pred_normals.shape}")
+    if gt_normals.shape != pred_normals.shape:
+        raise ValueError(
+            f"法线 GT 尺寸 {gt_normals.shape} 与预测 {pred_normals.shape} 不一致。"
+        )
+    gt_mask = torch.isfinite(gt_normals).all(dim=0)
+    pred_mask = torch.isfinite(pred_normals).all(dim=0)
+    valid_mask = base_mask & gt_mask & pred_mask
+    valid_pixels = int(valid_mask.sum().item())
+    if valid_pixels == 0:
+        zero = torch.zeros((), device=pred_normals.device)
+        stats = {"valid_px": 0, "mean_cos": float("nan")}
+        return zero, stats
+
+    pred_unit = F.normalize(pred_normals, dim=0)
+    gt_unit = F.normalize(gt_normals, dim=0)
+    cos_sim = (pred_unit * gt_unit).sum(dim=0).clamp(-1.0, 1.0)
+    loss_map = (1.0 - cos_sim) * valid_mask
+    loss = loss_map.sum() / valid_mask.sum()
+    stats = {"valid_px": valid_pixels, "mean_cos": float(cos_sim[valid_mask].mean().item())}
+    return loss, stats
 
 
 class ManualScene:
@@ -370,15 +563,23 @@ def main():
         "--normal_loss_weight", type=float, default=1.0, help="法线一致性项权重"
     )
     parser.add_argument(
+        "--lr",
+        "--learning_rate",
+        dest="lr",
+        type=float,
+        default=1e-3,
+        help="仅优化 XYZ 的学习率（默认 1e-3）",
+    )
+    parser.add_argument(
         "--delaunay_reset_interval",
         type=int,
-        default=50,
+        default=1000,
         help="每隔多少次迭代重建一次 Delaunay（<=0 表示每次重建）",
     )
     parser.add_argument(
         "--mesh_config",
         type=str,
-        default="verylowres",
+        default="medium",
         help="mesh 配置名称或路径（默认 verylowres）",
     )
     parser.add_argument(
@@ -393,12 +594,60 @@ def main():
         default="yufu2mesh_outputs",
         help="保存热力图等输出的目录",
     )
+    parser.add_argument(
+        "--depth_gt_dir",
+        type=str,
+        default="/home/zoyo/Desktop/MILo_rtx50/milo/data/bridge_clean/depth",
+        help="Discoverse 深度 npy 所在目录",
+    )
+    parser.add_argument(
+        "--depth_clip_min",
+        type=float,
+        default=0.0,
+        help="深度最小裁剪值，<=0 表示不裁剪",
+    )
+    parser.add_argument(
+        "--depth_clip_max",
+        type=float,
+        default=None,
+        help="深度最大裁剪值，None 表示不裁剪",
+    )
+    parser.add_argument(
+        "--normal_cache_dir",
+        type=str,
+        default=None,
+        help="法线缓存目录，默认为 runs/<heatmap_dir>/normal_gt",
+    )
+    parser.add_argument(
+        "--skip_normal_gt_generation",
+        action="store_true",
+        help="已存在缓存时跳过初始法线 GT 预计算",
+    )
     parser.add_argument("--seed", type=int, default=0, help="控制随机性的种子")
     parser.add_argument(
         "--lock_view_index",
         type=int,
         default=None,
         help="固定视角索引，仅在指定时输出热力图",
+    )
+    parser.add_argument(
+        "--log_interval",
+        type=int,
+        default=100,
+        help="控制迭代日志的打印频率（默认每次迭代打印）",
+    )
+    parser.add_argument(
+        "--warn_until_iter",
+        type=int,
+        default=3000,
+        help="surface sampling warmup 迭代数（用于 mesh downsample）",
+    )
+    parser.add_argument(
+        "--imp_metric",
+        type=str,
+        default="outdoor",
+        choices=["outdoor", "indoor"],
+        help="surface sampling 的重要性度量类型",
     )
     pipe = PipelineParams(parser)
     args = parser.parse_args()
@@ -421,7 +670,20 @@ def main():
 
     gaussians = GaussianModel(sh_degree=0, learn_occupancy=True)
     gaussians.load_ply(ply_path)
-    freeze_gaussian_model(gaussians)
+    freeze_attrs = [
+        "_features_dc",
+        "_features_rest",
+        "_scaling",
+        "_rotation",
+        "_opacity",
+        "_base_occupancy",
+        "_occupancy_shift",
+    ]
+    for attr in freeze_attrs:
+        value = getattr(gaussians, attr, None)
+        if isinstance(value, torch.Tensor):
+            value.requires_grad_(False)
+    gaussians._xyz.requires_grad_(True)
 
     height = 720
     width = 1280
@@ -433,9 +695,11 @@ def main():
         image_width=width,
         fov_y_deg=fov_y_deg,
     )
-    print(f"[INFO] 成功加载 {len(train_cameras)} 个相机视角。")
+    num_views = len(train_cameras)
+    print(f"[INFO] 成功加载 {num_views} 个相机视角。")
 
-    background = torch.tensor([0.0, 0.0, 0.0], device="cuda")
+    device = gaussians._xyz.device
+    background = torch.tensor([0.0, 0.0, 0.0], device=device)
 
     mesh_config = load_mesh_config(args.mesh_config)
     mesh_config["start_iter"] = 0
@@ -454,66 +718,159 @@ def main():
 
     render_view, render_for_sdf = build_render_functions(gaussians, pipe, background)
 
+    depth_clip_min = args.depth_clip_min if args.depth_clip_min > 0.0 else None
+    depth_clip_max = args.depth_clip_max
+    depth_provider = DepthProvider(
+        depth_root=Path(args.depth_gt_dir),
+        image_height=height,
+        image_width=width,
+        device=device,
+        clip_min=depth_clip_min,
+        clip_max=depth_clip_max,
+    )
+
+    normal_cache_dir = Path(args.normal_cache_dir) if args.normal_cache_dir else (output_dir / "normal_gt")
+    normal_cache = NormalGroundTruthCache(
+        cache_dir=normal_cache_dir,
+        image_height=height,
+        image_width=width,
+        device=device,
+    )
+    if args.skip_normal_gt_generation:
+        missing = [idx for idx in range(num_views) if not normal_cache.has(idx)]
+        if missing:
+            raise RuntimeError(
+                f"跳过法线 GT 预计算被拒绝，仍有 {len(missing)} 个视角缺少缓存（示例 {missing[:5]}）。"
+            )
+    else:
+        print("[INFO] 开始预计算初始法线 GT（仅进行一次，若存在缓存会自动跳过）。")
+        normal_cache.ensure_all(train_cameras, render_view)
+        normal_cache.clear_memory_cache()
+
     mesh_renderer, mesh_state = initialize_mesh_regularization(scene_wrapper, mesh_config)
     mesh_state["reset_delaunay_samples"] = True
     mesh_state["reset_sdf_values"] = True
 
+    optimizer = torch.optim.Adam([gaussians._xyz], lr=args.lr)
+    mesh_args = SimpleNamespace(
+        warn_until_iter=args.warn_until_iter,
+        imp_metric=args.imp_metric,
+    )
+
+    # 记录整个迭代过程中的指标与梯度，结束时统一写入 npz/曲线
+    stats_history: Dict[str, List[float]] = {
+        "iteration": [],
+        "depth_loss": [],
+        "normal_loss": [],
+        "mesh_loss": [],
+        "mesh_depth_loss": [],
+        "mesh_normal_loss": [],
+        "occupied_centers_loss": [],
+        "occupancy_labels_loss": [],
+        "depth_mae": [],
+        "depth_rmse": [],
+        "normal_mean_cos": [],
+        "normal_valid_px": [],
+        "grad_norm": [],
+    }
+
     moving_loss = None
     previous_depth: Dict[int, np.ndarray] = {}
     previous_normals: Dict[int, np.ndarray] = {}
-    camera_stack = list(range(len(train_cameras)))
+    camera_stack = list(range(num_views))
     random.shuffle(camera_stack)
     save_interval = args.save_interval if args.save_interval is not None else args.delaunay_reset_interval
     if save_interval is None or save_interval <= 0:
         save_interval = 1
 
     for iteration in range(args.num_iterations):
-        with torch.no_grad():
-            if args.lock_view_index is not None:
-                view_index = args.lock_view_index % len(train_cameras)
-            else:
-                if not camera_stack:
-                    camera_stack = list(range(len(train_cameras)))
-                    random.shuffle(camera_stack)
-                view_index = camera_stack.pop()
-            viewpoint = train_cameras[view_index]
+        optimizer.zero_grad(set_to_none=True)
+        if args.lock_view_index is not None:
+            view_index = args.lock_view_index % num_views
+        else:
+            if not camera_stack:
+                camera_stack = list(range(num_views))
+                random.shuffle(camera_stack)
+            view_index = camera_stack.pop()
+        viewpoint = train_cameras[view_index]
 
-            gaussian_render_pkg = render_view(viewpoint)
-            mesh_pkg = compute_mesh_regularization(
-                iteration=iteration,
-                render_pkg=gaussian_render_pkg,
-                viewpoint_cam=viewpoint,
-                viewpoint_idx=view_index,
-                gaussians=gaussians,
-                scene=scene_wrapper,
-                pipe=pipe,
-                background=background,
-                kernel_size=0.0,
-                config=mesh_config,
-                mesh_renderer=mesh_renderer,
-                mesh_state=mesh_state,
-                render_func=render_for_sdf,
-                weight_adjustment=1.0,
-                args=None,
-                integrate_func=integrate_radegs,
-            )
-            mesh_state = mesh_pkg["updated_state"]
+        training_pkg = render_view(viewpoint)
+        gt_depth_tensor, gt_depth_mask = depth_provider.get(view_index)
+        depth_loss_tensor, depth_stats = compute_depth_loss_tensor(
+            pred_depth=training_pkg["median_depth"],
+            gt_depth=gt_depth_tensor,
+            gt_mask=gt_depth_mask,
+        )
+        gt_normals_tensor = normal_cache.get(view_index)
+        normal_loss_tensor, normal_stats = compute_normal_loss_tensor(
+            pred_normals=training_pkg["normal"],
+            gt_normals=gt_normals_tensor,
+            base_mask=gt_depth_mask,
+        )
+        mesh_pkg = compute_mesh_regularization(
+            iteration=iteration,
+            render_pkg=training_pkg,
+            viewpoint_cam=viewpoint,
+            viewpoint_idx=view_index,
+            gaussians=gaussians,
+            scene=scene_wrapper,
+            pipe=pipe,
+            background=background,
+            kernel_size=0.0,
+            config=mesh_config,
+            mesh_renderer=mesh_renderer,
+            mesh_state=mesh_state,
+            render_func=render_for_sdf,
+            weight_adjustment=1.0,
+            args=mesh_args,
+            integrate_func=integrate_radegs,
+        )
+        mesh_state = mesh_pkg["updated_state"]
+        mesh_loss_tensor = mesh_pkg["mesh_loss"]
+        total_loss = (
+            args.depth_loss_weight * depth_loss_tensor
+            + args.normal_loss_weight * normal_loss_tensor
+            + mesh_loss_tensor
+        )
+        depth_loss_value = float(depth_loss_tensor.detach().item())
+        normal_loss_value = float(normal_loss_tensor.detach().item())
+        mesh_loss_value = float(mesh_loss_tensor.detach().item())
+        loss_value = float(total_loss.detach().item())
+
+        if total_loss.requires_grad:
+            total_loss.backward()
+            grad_norm = float(gaussians._xyz.grad.detach().norm().item())
+            optimizer.step()
+        else:
+            optimizer.zero_grad(set_to_none=True)
+            grad_norm = float("nan")
 
         mesh_render_pkg = mesh_pkg["mesh_render_pkg"]
-        depth_map = prepare_depth_map(mesh_render_pkg["depth"])
-        normals_map = prepare_normals(mesh_render_pkg["normals"])
-        ply_depth_map = prepare_depth_map(gaussian_render_pkg["median_depth"])
-        ply_normals_map = prepare_normals(gaussian_render_pkg["normal"])
+        mesh_depth_map = prepare_depth_map(mesh_render_pkg["depth"])
+        mesh_normals_map = prepare_normals(mesh_render_pkg["normals"])
+        gaussian_depth_map = prepare_depth_map(training_pkg["median_depth"])
+        gaussian_normals_map = prepare_normals(training_pkg["normal"])
+        gt_depth_map = depth_provider.as_numpy(view_index)
+        gt_normals_map = prepare_normals(gt_normals_tensor)
 
-        mesh_valid = np.isfinite(depth_map) & (depth_map > 0.0)
-        ply_valid = np.isfinite(ply_depth_map) & (ply_depth_map > 0.0)
-        overlap_mask = mesh_valid & ply_valid
+        mesh_valid = np.isfinite(mesh_depth_map) & (mesh_depth_map > 0.0)
+        gaussian_valid = np.isfinite(gaussian_depth_map) & (gaussian_depth_map > 0.0)
+        gt_valid = np.isfinite(gt_depth_map) & (gt_depth_map > 0.0)
+        overlap_mask = gaussian_valid & gt_valid
 
-        depth_loss_value = float(mesh_pkg["mesh_depth_loss"].item())
-        normal_loss_value = float(mesh_pkg["mesh_normal_loss"].item())
+        depth_delta = gaussian_depth_map - gt_depth_map
+        if overlap_mask.any():
+            delta_abs = np.abs(depth_delta[overlap_mask])
+            diff_mean = float(delta_abs.mean())
+            diff_max = float(delta_abs.max())
+            diff_rmse = float(np.sqrt(np.mean(depth_delta[overlap_mask] ** 2)))
+        else:
+            diff_mean = diff_max = diff_rmse = float("nan")
+
+        mesh_depth_loss = float(mesh_pkg["mesh_depth_loss"].item())
+        mesh_normal_loss = float(mesh_pkg["mesh_normal_loss"].item())
         occupied_loss = float(mesh_pkg["occupied_centers_loss"].item())
         labels_loss = float(mesh_pkg["occupancy_labels_loss"].item())
-        loss_value = float(mesh_pkg["mesh_loss"].item())
 
         moving_loss = (
             loss_value
@@ -521,26 +878,44 @@ def main():
             else args.ma_beta * moving_loss + (1 - args.ma_beta) * loss_value
         )
 
+        stats_history["iteration"].append(float(iteration))
+        stats_history["depth_loss"].append(depth_loss_value)
+        stats_history["normal_loss"].append(normal_loss_value)
+        stats_history["mesh_loss"].append(mesh_loss_value)
+        stats_history["mesh_depth_loss"].append(mesh_depth_loss)
+        stats_history["mesh_normal_loss"].append(mesh_normal_loss)
+        stats_history["occupied_centers_loss"].append(occupied_loss)
+        stats_history["occupancy_labels_loss"].append(labels_loss)
+        stats_history["depth_mae"].append(depth_stats["mae"])
+        stats_history["depth_rmse"].append(depth_stats["rmse"])
+        stats_history["normal_mean_cos"].append(normal_stats["mean_cos"])
+        stats_history["normal_valid_px"].append(float(normal_stats["valid_px"]))
+        stats_history["grad_norm"].append(grad_norm)
+
         def _fmt(value: float) -> str:
             return f"{value:.6f}"
 
-        print(
-            "[INFO] Iter {iter:02d} | loss={total} (depth={depth}, normal={normal}) | ma_loss={ma}".format(
-                iter=iteration,
-                total=_fmt(loss_value),
-                depth=_fmt(depth_loss_value),
-                normal=_fmt(normal_loss_value),
-                ma=f"{moving_loss:.6f}",
+        if (iteration % max(1, args.log_interval) == 0) or (iteration == args.num_iterations - 1):
+            print(
+                "[INFO] Iter {iter:02d} | loss={total} (depth={depth}, normal={normal}, mesh={mesh}) | ma_loss={ma}".format(
+                    iter=iteration,
+                    total=_fmt(loss_value),
+                    depth=_fmt(depth_loss_value),
+                    normal=_fmt(normal_loss_value),
+                    mesh=_fmt(mesh_loss_value),
+                    ma=f"{moving_loss:.6f}",
+                )
             )
-        )
 
         should_save = (save_interval <= 0) or (iteration % save_interval == 0)
         if should_save:
             valid_values: List[np.ndarray] = []
             if mesh_valid.any():
-                valid_values.append(depth_map[mesh_valid].reshape(-1))
-            if ply_valid.any():
-                valid_values.append(ply_depth_map[ply_valid].reshape(-1))
+                valid_values.append(mesh_depth_map[mesh_valid].reshape(-1))
+            if gaussian_valid.any():
+                valid_values.append(gaussian_depth_map[gaussian_valid].reshape(-1))
+            if gt_valid.any():
+                valid_values.append(gt_depth_map[gt_valid].reshape(-1))
             if valid_values:
                 all_valid = np.concatenate(valid_values)
                 shared_min = float(all_valid.min())
@@ -548,99 +923,125 @@ def main():
             else:
                 shared_min, shared_max = 0.0, 1.0
 
-            ply_depth_vis_path = output_dir / f"ply_depth_vis_iter_{iteration:02d}.png"
-            plt.imsave(ply_depth_vis_path, ply_depth_map, cmap="viridis", vmin=shared_min, vmax=shared_max)
+            gaussian_depth_vis_path = output_dir / f"gaussian_depth_vis_iter_{iteration:02d}.png"
+            plt.imsave(
+                gaussian_depth_vis_path,
+                gaussian_depth_map,
+                cmap="viridis",
+                vmin=shared_min,
+                vmax=shared_max,
+            )
 
-            depth_vis_path = output_dir / f"depth_vis_iter_{iteration:02d}.png"
-            plt.imsave(depth_vis_path, depth_map, cmap="viridis", vmin=shared_min, vmax=shared_max)
+            depth_vis_path = output_dir / f"mesh_depth_vis_iter_{iteration:02d}.png"
+            plt.imsave(
+                depth_vis_path,
+                mesh_depth_map,
+                cmap="viridis",
+                vmin=shared_min,
+                vmax=shared_max,
+            )
 
-            normal_vis_path = output_dir / f"normal_vis_iter_{iteration:02d}.png"
-            normals_rgb = normals_to_rgb(normals_map)
-            save_normal_visualization(normals_rgb, normal_vis_path)
+            gt_depth_vis_path = output_dir / f"gt_depth_vis_iter_{iteration:02d}.png"
+            plt.imsave(
+                gt_depth_vis_path,
+                gt_depth_map,
+                cmap="viridis",
+                vmin=shared_min,
+                vmax=shared_max,
+            )
 
-            ply_normal_vis_path = output_dir / f"ply_normal_vis_iter_{iteration:02d}.png"
-            ply_normals_rgb = normals_to_rgb(ply_normals_map)
-            save_normal_visualization(ply_normals_rgb, ply_normal_vis_path)
+            normal_vis_path = output_dir / f"mesh_normal_vis_iter_{iteration:02d}.png"
+            mesh_normals_rgb = normals_to_rgb(mesh_normals_map)
+            save_normal_visualization(mesh_normals_rgb, normal_vis_path)
+
+            gaussian_normal_vis_path = output_dir / f"gaussian_normal_vis_iter_{iteration:02d}.png"
+            gaussian_normals_rgb = normals_to_rgb(gaussian_normals_map)
+            save_normal_visualization(gaussian_normals_rgb, gaussian_normal_vis_path)
+
+            gt_normal_vis_path = output_dir / f"gt_normal_vis_iter_{iteration:02d}.png"
+            gt_normals_rgb = normals_to_rgb(gt_normals_map)
+            save_normal_visualization(gt_normals_rgb, gt_normal_vis_path)
 
             output_npz = output_dir / f"mesh_render_iter_{iteration:02d}.npz"
             np.savez(
                 output_npz,
-                depth=depth_map,
-                ply_depth=ply_depth_map,
-                normals=normals_map,
-                normal_vis=normals_rgb,
-                ply_normals=ply_normals_map,
-                ply_normal_vis=ply_normals_rgb,
+                mesh_depth=mesh_depth_map,
+                gaussian_depth=gaussian_depth_map,
+                depth_gt=gt_depth_map,
+                mesh_normals=mesh_normals_map,
+                gaussian_normals=gaussian_normals_map,
+                normal_gt=gt_normals_map,
                 depth_loss=depth_loss_value,
                 normal_loss=normal_loss_value,
+                mesh_loss=mesh_loss_value,
+                mesh_depth_loss=mesh_depth_loss,
+                mesh_normal_loss=mesh_normal_loss,
                 occupied_centers_loss=occupied_loss,
                 occupancy_labels_loss=labels_loss,
                 loss=loss_value,
                 moving_loss=moving_loss,
+                depth_mae=depth_stats["mae"],
+                depth_rmse=depth_stats["rmse"],
+                normal_valid_px=normal_stats["valid_px"],
+                normal_mean_cos=normal_stats["mean_cos"],
+                grad_norm=grad_norm,
+                iteration=iteration,
+                learning_rate=optimizer.param_groups[0]["lr"],
             )
 
             if overlap_mask.any():
-                depth_delta = depth_map - ply_depth_map
-                delta_abs = np.abs(depth_delta[overlap_mask])
-                diff_mean = float(delta_abs.mean())
-                diff_max = float(delta_abs.max())
-                diff_rmse = float(np.sqrt(np.mean(depth_delta[overlap_mask] ** 2)))
-            else:
-                diff_mean = diff_max = diff_rmse = float("nan")
+                depth_diff_vis = np.zeros_like(gaussian_depth_map)
+                depth_diff_vis[overlap_mask] = depth_delta[overlap_mask]
+                save_heatmap(
+                    np.abs(depth_diff_vis),
+                    output_dir / f"depth_diff_iter_{iteration:02d}.png",
+                    f"|Pred-GT| iter {iteration}",
+                )
 
             composite_path = output_dir / f"comparison_iter_{iteration:02d}.png"
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10), dpi=300)
-            ax_ply_depth, ax_mesh_depth = axes[0]
-            ax_ply_normals, ax_mesh_normals = axes[1]
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10), dpi=300)
+            ax_gt_depth, ax_gaussian_depth, ax_mesh_depth = axes[0]
+            ax_gt_normals, ax_gaussian_normals, ax_mesh_normals = axes[1]
 
-            im0 = ax_ply_depth.imshow(ply_depth_map, cmap="viridis", vmin=shared_min, vmax=shared_max)
-            ax_ply_depth.axis("off")
-            fig.colorbar(im0, ax=ax_ply_depth, fraction=0.046, pad=0.04)
+            im0 = ax_gt_depth.imshow(gt_depth_map, cmap="viridis", vmin=shared_min, vmax=shared_max)
+            ax_gt_depth.set_title("GT depth")
+            ax_gt_depth.axis("off")
+            fig.colorbar(im0, ax=ax_gt_depth, fraction=0.046, pad=0.04)
 
-            im1 = ax_mesh_depth.imshow(depth_map, cmap="viridis", vmin=shared_min, vmax=shared_max)
+            im1 = ax_gaussian_depth.imshow(gaussian_depth_map, cmap="viridis", vmin=shared_min, vmax=shared_max)
+            ax_gaussian_depth.set_title("Gaussian depth")
+            ax_gaussian_depth.axis("off")
+            fig.colorbar(im1, ax=ax_gaussian_depth, fraction=0.046, pad=0.04)
+
+            im2 = ax_mesh_depth.imshow(mesh_depth_map, cmap="viridis", vmin=shared_min, vmax=shared_max)
+            ax_mesh_depth.set_title("Mesh depth")
             ax_mesh_depth.axis("off")
-            fig.colorbar(im1, ax=ax_mesh_depth, fraction=0.046, pad=0.04)
+            fig.colorbar(im2, ax=ax_mesh_depth, fraction=0.046, pad=0.04)
 
-            ax_ply_normals.imshow(ply_normals_rgb)
-            ax_ply_normals.axis("off")
+            ax_gt_normals.imshow(gt_normals_rgb)
+            ax_gt_normals.set_title("GT normals")
+            ax_gt_normals.axis("off")
 
-            ax_mesh_normals.imshow(normals_rgb)
+            ax_gaussian_normals.imshow(gaussian_normals_rgb)
+            ax_gaussian_normals.set_title("Gaussian normals")
+            ax_gaussian_normals.axis("off")
+
+            ax_mesh_normals.imshow(mesh_normals_rgb)
+            ax_mesh_normals.set_title("Mesh normals")
             ax_mesh_normals.axis("off")
+
             info_lines = [
                 f"Iteration: {iteration:02d}",
                 f"View index: {view_index}",
-                f"PLY depth valid px: {int(ply_valid.sum())}",
+                f"GT depth valid px: {int(gt_valid.sum())}",
+                f"Gaussian depth valid px: {int(gaussian_valid.sum())}",
+                f"|Pred - GT| mean={diff_mean:.3f}, max={diff_max:.3f}, RMSE={diff_rmse:.3f}",
+                f"Depth loss={_fmt(depth_loss_value)} (w={args.depth_loss_weight:.2f}, mae={depth_stats['mae']:.3f}, rmse={depth_stats['rmse']:.3f})",
+                f"Normal loss={_fmt(normal_loss_value)} (w={args.normal_loss_weight:.2f}, px={normal_stats['valid_px']}, cos={normal_stats['mean_cos']:.3f})",
+                f"Mesh loss={_fmt(mesh_loss_value)}",
+                f"Mesh depth loss={_fmt(mesh_depth_loss)} mesh normal loss={_fmt(mesh_normal_loss)}",
+                f"Occupied centers={_fmt(occupied_loss)} labels={_fmt(labels_loss)}",
             ]
-            if ply_valid.any():
-                info_lines.append(
-                    f"  min={float(ply_depth_map[ply_valid].min()):.3f}, "
-                    f"max={float(ply_depth_map[ply_valid].max()):.3f}, "
-                    f"mean={float(ply_depth_map[ply_valid].mean()):.3f}"
-                )
-            info_lines.append(f"Mesh depth valid px: {int(mesh_valid.sum())}")
-            if mesh_valid.any():
-                info_lines.append(
-                    f"  min={float(depth_map[mesh_valid].min()):.3f}, "
-                    f"max={float(depth_map[mesh_valid].max()):.3f}, "
-                    f"mean={float(depth_map[mesh_valid].mean()):.3f}"
-                )
-            if overlap_mask.any():
-                info_lines.append(f"|PLY - Mesh| mean={diff_mean:.3f}, max={diff_max:.3f}, RMSE={diff_rmse:.3f}")
-            else:
-                info_lines.append("No overlapping valid depth pixels.")
-            info_lines.append(
-                f"Depth loss={_fmt(depth_loss_value)} (w={args.depth_loss_weight:.2f})"
-            )
-            info_lines.append(
-                f"Normal loss={_fmt(normal_loss_value)} (w={args.normal_loss_weight:.2f})"
-            )
-            info_lines.append(f"Occupied centers={_fmt(occupied_loss)}")
-            info_lines.append(f"Labels loss={_fmt(labels_loss)}")
-            info_lines.append(f"Overlap px={int(overlap_mask.sum())}")
-            mesh_norm_valid = np.all(np.isfinite(normals_map), axis=-1)
-            ply_norm_valid = np.all(np.isfinite(ply_normals_map), axis=-1)
-            normal_overlap_mask = overlap_mask & mesh_norm_valid & ply_norm_valid
-            info_lines.append(f"Normal px={int(normal_overlap_mask.sum())}")
             fig.suptitle("\n".join(info_lines), fontsize=12, y=0.98)
             fig.tight_layout(rect=[0, 0, 1, 0.94])
             fig.savefig(composite_path, dpi=300)
@@ -648,30 +1049,89 @@ def main():
 
             if args.lock_view_index is not None:
                 if view_index in previous_depth:
-                    depth_diff = np.abs(depth_map - previous_depth[view_index])
-                    save_heatmap(depth_diff, output_dir / f"depth_diff_iter_{iteration:02d}.png", f"Depth Δ iter {iteration}")
+                    depth_diff = np.abs(gaussian_depth_map - previous_depth[view_index])
+                    save_heatmap(
+                        depth_diff,
+                        output_dir / f"depth_diff_iter_{iteration:02d}_temporal.png",
+                        f"Depth Δ iter {iteration}",
+                    )
                 if view_index in previous_normals:
-                    normal_delta = normals_map - previous_normals[view_index]
+                    normal_delta = gaussian_normals_map - previous_normals[view_index]
                     if normal_delta.ndim == 3:
                         normal_diff = np.linalg.norm(normal_delta, axis=-1)
                     else:
                         normal_diff = np.abs(normal_delta)
                     save_heatmap(
                         normal_diff,
-                        output_dir / f"normal_diff_iter_{iteration:02d}.png",
+                        output_dir / f"normal_diff_iter_{iteration:02d}_temporal.png",
                         f"Normal Δ iter {iteration}",
                     )
 
-            export_mesh_from_state(
-                gaussians=gaussians,
-                mesh_state=mesh_state,
-                output_path=output_dir / f"mesh_iter_{iteration:02d}.ply",
-                reference_camera=viewpoint,
-            )
+            with torch.no_grad():
+                export_mesh_from_state(
+                    gaussians=gaussians,
+                    mesh_state=mesh_state,
+                    output_path=output_dir / f"mesh_iter_{iteration:02d}.ply",
+                    reference_camera=None,
+                )
 
         if args.lock_view_index is not None:
-            previous_depth[view_index] = depth_map
-            previous_normals[view_index] = normals_map
+            previous_depth[view_index] = gaussian_depth_map
+            previous_normals[view_index] = gaussian_normals_map
+    with torch.no_grad():
+        # 输出完整指标轨迹及汇总曲线，方便任务结束后快速复盘
+        history_npz = output_dir / "metrics_history.npz"
+        np.savez(
+            history_npz,
+            **{k: np.asarray(v, dtype=np.float32) for k, v in stats_history.items()},
+        )
+        summary_fig = output_dir / "metrics_summary.png"
+        if stats_history["iteration"]:
+            fig, axes = plt.subplots(2, 2, figsize=(16, 10), dpi=200)
+            iters = np.asarray(stats_history["iteration"])
+            axes[0, 0].plot(iters, stats_history["depth_loss"], label="depth")
+            axes[0, 0].plot(iters, stats_history["normal_loss"], label="normal")
+            axes[0, 0].plot(iters, stats_history["mesh_loss"], label="mesh")
+            axes[0, 0].set_title("Total losses")
+            axes[0, 0].set_xlabel("Iteration")
+            axes[0, 0].legend()
+
+            axes[0, 1].plot(iters, stats_history["mesh_depth_loss"], label="mesh depth")
+            axes[0, 1].plot(iters, stats_history["mesh_normal_loss"], label="mesh normal")
+            axes[0, 1].plot(iters, stats_history["occupied_centers_loss"], label="occupied centers")
+            axes[0, 1].plot(iters, stats_history["occupancy_labels_loss"], label="occupancy labels")
+            axes[0, 1].set_title("Mesh regularization components")
+            axes[0, 1].set_xlabel("Iteration")
+            axes[0, 1].legend()
+
+            axes[1, 0].plot(iters, stats_history["depth_mae"], label="depth MAE")
+            axes[1, 0].plot(iters, stats_history["depth_rmse"], label="depth RMSE")
+            axes[1, 0].set_title("Depth metrics")
+            axes[1, 0].set_xlabel("Iteration")
+            axes[1, 0].legend()
+
+            axes[1, 1].plot(iters, stats_history["normal_mean_cos"], label="mean cos")
+            axes[1, 1].plot(iters, stats_history["grad_norm"], label="grad norm")
+            axes[1, 1].set_title("Normals / Gradients")
+            axes[1, 1].set_xlabel("Iteration")
+            axes[1, 1].legend()
+
+            fig.tight_layout()
+            fig.savefig(summary_fig)
+            plt.close(fig)
+            print(f"[INFO] 已保存曲线汇总：{summary_fig}")
+        print(f"[INFO] 记录所有迭代指标到 {history_npz}")
+        final_mesh_path = output_dir / "mesh_final.ply"
+        final_gaussian_path = output_dir / "gaussians_final.ply"
+        print(f"[INFO] 导出最终 mesh 到 {final_mesh_path}")
+        export_mesh_from_state(
+            gaussians=gaussians,
+            mesh_state=mesh_state,
+            output_path=final_mesh_path,
+            reference_camera=None,
+        )
+        print(f"[INFO] 导出最终高斯到 {final_gaussian_path}")
+        gaussians.save_ply(str(final_gaussian_path))
     print("[INFO] 循环结束，所有结果已写入输出目录。")
 
 
