@@ -22,6 +22,7 @@ from functional import (
 )
 from scene.cameras import Camera
 from scene.gaussian_model import GaussianModel
+from gaussian_renderer import render_full
 from gaussian_renderer.radegs import render_radegs, integrate_radegs
 from arguments import PipelineParams
 from regularization.regularizer.mesh import (
@@ -251,33 +252,21 @@ def build_render_functions(
     pipe: PipelineParams,
     background: torch.Tensor,
 ):
-    """构建与训练阶段一致的 RaDe-GS 渲染接口，兼顾常规前向和 SDF 重建需求。"""
-    def _render(
-        view: Camera,
-        pc_obj: GaussianModel,
-        pipe_obj: PipelineParams,
-        bg_color: torch.Tensor,
-        *,
-        kernel_size: float = 0.0,
-        require_coord: bool = False,
-        require_depth: bool = True,
-    ):
-        pkg = render_radegs(
+    """构建训练/重建所需的渲染器：训练走 render_full 以获得精确深度梯度，SDF 仍沿用 RaDe-GS。"""
+
+    def render_view(view: Camera) -> Dict[str, torch.Tensor]:
+        pkg = render_full(
             viewpoint_camera=view,
-            pc=pc_obj,
-            pipe=pipe_obj,
-            bg_color=bg_color,
-            kernel_size=kernel_size,
-            scaling_modifier=1.0,
-            require_coord=require_coord,
-            require_depth=require_depth,
+            pc=gaussians,
+            pipe=pipe,
+            bg_color=background,
+            compute_expected_normals=False,
+            compute_expected_depth=True,
+            compute_accurate_median_depth_gradient=True,
         )
         if "area_max" not in pkg:
             pkg["area_max"] = torch.zeros_like(pkg["radii"])
         return pkg
-
-    def render_view(view: Camera):
-        return _render(view, gaussians, pipe, background)
 
     def render_for_sdf(
         view: Camera,
@@ -291,15 +280,18 @@ def build_render_functions(
         pc_obj = gaussians if gaussians_override is None else gaussians_override
         pipe_obj = pipe if pipeline_override is None else pipeline_override
         bg_color = background if background_override is None else background_override
-        pkg = _render(
-            view,
-            pc_obj,
-            pipe_obj,
-            bg_color,
+        pkg = render_radegs(
+            viewpoint_camera=view,
+            pc=pc_obj,
+            pipe=pipe_obj,
+            bg_color=bg_color,
             kernel_size=kernel_size,
+            scaling_modifier=1.0,
             require_coord=require_coord,
             require_depth=require_depth,
         )
+        if "area_max" not in pkg:
+            pkg["area_max"] = torch.zeros_like(pkg["radii"])
         return {
             "render": pkg["render"].detach(),
             "median_depth": pkg["median_depth"].detach(),
@@ -567,8 +559,8 @@ def main():
         "--learning_rate",
         dest="lr",
         type=float,
-        default=1e-3,
-        help="仅优化 XYZ 的学习率（默认 1e-3）",
+        default=5e-4,
+        help="仅优化 XYZ 的学习率（默认 5e-4）",
     )
     parser.add_argument(
         "--delaunay_reset_interval",
@@ -580,7 +572,7 @@ def main():
         "--mesh_config",
         type=str,
         default="medium",
-        help="mesh 配置名称或路径（默认 verylowres）",
+        help="mesh 配置名称或路径（默认 medium）",
     )
     parser.add_argument(
         "--save_interval",
@@ -649,6 +641,30 @@ def main():
         choices=["outdoor", "indoor"],
         help="surface sampling 的重要性度量类型",
     )
+    parser.add_argument(
+        "--mesh_start_iter",
+        type=int,
+        default=2000,
+        help="mesh 正则起始迭代（默认 2000，避免冷启动阶段干扰）",
+    )
+    parser.add_argument(
+        "--mesh_update_interval",
+        type=int,
+        default=5,
+        help="mesh 正则重建/回传间隔，>1 可减少 DMTet 抖动（默认 5）",
+    )
+    parser.add_argument(
+        "--mesh_depth_weight",
+        type=float,
+        default=0.1,
+        help="mesh 深度项权重覆盖（默认 0.1，原配置通常为 0.05）",
+    )
+    parser.add_argument(
+        "--mesh_normal_weight",
+        type=float,
+        default=0.1,
+        help="mesh 法线项权重覆盖（默认 0.1，原配置通常为 0.05）",
+    )
     pipe = PipelineParams(parser)
     args = parser.parse_args()
 
@@ -702,10 +718,12 @@ def main():
     background = torch.tensor([0.0, 0.0, 0.0], device=device)
 
     mesh_config = load_mesh_config(args.mesh_config)
-    mesh_config["start_iter"] = 0
+    mesh_config["start_iter"] = max(0, args.mesh_start_iter)
     mesh_config["stop_iter"] = max(mesh_config.get("stop_iter", args.num_iterations), args.num_iterations)
-    mesh_config["mesh_update_interval"] = 1
+    mesh_config["mesh_update_interval"] = max(1, args.mesh_update_interval)
     mesh_config["delaunay_reset_interval"] = args.delaunay_reset_interval
+    mesh_config["depth_weight"] = args.mesh_depth_weight
+    mesh_config["normal_weight"] = args.mesh_normal_weight
     # 这里默认沿用 surface 采样以对齐训练阶段；如仅需快速分析，也可以切换为 random 提升速度。
     mesh_config["delaunay_sampling_method"] = "surface"
 
