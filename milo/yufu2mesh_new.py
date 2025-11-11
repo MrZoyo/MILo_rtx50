@@ -825,24 +825,51 @@ def main():
             gt_normals=gt_normals_tensor,
             base_mask=gt_depth_mask,
         )
-        mesh_pkg = compute_mesh_regularization(
-            iteration=iteration,
-            render_pkg=training_pkg,
-            viewpoint_cam=viewpoint,
-            viewpoint_idx=view_index,
-            gaussians=gaussians,
-            scene=scene_wrapper,
-            pipe=pipe,
-            background=background,
-            kernel_size=0.0,
-            config=mesh_config,
-            mesh_renderer=mesh_renderer,
-            mesh_state=mesh_state,
-            render_func=render_for_sdf,
-            weight_adjustment=1.0,
-            args=mesh_args,
-            integrate_func=integrate_radegs,
-        )
+        def _zero_mesh_pkg() -> Dict[str, Any]:
+            zero = torch.zeros((), device=device)
+            depth_zero = torch.zeros_like(training_pkg["median_depth"])
+            normal_zero = torch.zeros(
+                training_pkg["median_depth"].shape[-2],
+                training_pkg["median_depth"].shape[-1],
+                3,
+                device=device,
+            )
+            return {
+                "mesh_loss": zero,
+                "mesh_depth_loss": zero,
+                "mesh_normal_loss": zero,
+                "occupied_centers_loss": zero,
+                "occupancy_labels_loss": zero,
+                "updated_state": mesh_state,
+                "mesh_render_pkg": {
+                    "depth": depth_zero,
+                    "normals": normal_zero,
+                },
+            }
+
+        mesh_active = iteration >= mesh_config["start_iter"]
+        if mesh_active:
+            mesh_pkg = compute_mesh_regularization(
+                iteration=iteration,
+                render_pkg=training_pkg,
+                viewpoint_cam=viewpoint,
+                viewpoint_idx=view_index,
+                gaussians=gaussians,
+                scene=scene_wrapper,
+                pipe=pipe,
+                background=background,
+                kernel_size=0.0,
+                config=mesh_config,
+                mesh_renderer=mesh_renderer,
+                mesh_state=mesh_state,
+                render_func=render_for_sdf,
+                weight_adjustment=1.0,
+                args=mesh_args,
+                integrate_func=integrate_radegs,
+            )
+        else:
+            mesh_pkg = _zero_mesh_pkg()
+
         mesh_state = mesh_pkg["updated_state"]
         mesh_loss_tensor = mesh_pkg["mesh_loss"]
         total_loss = (
