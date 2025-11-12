@@ -1117,32 +1117,32 @@ def main():
             fig.savefig(composite_path, dpi=300)
             plt.close(fig)
 
-            if lock_view_mode and lock_view_output_dir is not None:
-                if view_index in previous_depth:
-                    depth_diff = np.abs(gaussian_depth_map - previous_depth[view_index])
-                    save_heatmap(
-                        depth_diff,
-                        lock_view_output_dir / f"depth_diff_iter_{iteration:02d}_temporal.png",
-                        f"Depth Δ iter {iteration}",
-                    )
-                if view_index in previous_normals:
-                    normal_delta = gaussian_normals_map - previous_normals[view_index]
-                    if normal_delta.ndim == 3:
-                        normal_diff = np.linalg.norm(normal_delta, axis=-1)
-                    else:
-                        normal_diff = np.abs(normal_delta)
-                    save_heatmap(
-                        normal_diff,
-                        lock_view_output_dir / f"normal_diff_iter_{iteration:02d}_temporal.png",
-                        f"Normal Δ iter {iteration}",
-                    )
-
             with torch.no_grad():
                 export_mesh_from_state(
                     gaussians=gaussians,
                     mesh_state=mesh_state,
                     output_path=output_dir / f"mesh_iter_{iteration:02d}.ply",
                     reference_camera=None,
+                )
+
+        if lock_view_mode and lock_view_output_dir is not None:
+            if view_index in previous_depth:
+                depth_diff = np.abs(gaussian_depth_map - previous_depth[view_index])
+                save_heatmap(
+                    depth_diff,
+                    lock_view_output_dir / f"depth_diff_iter_{iteration:02d}_temporal.png",
+                    f"Depth Δ iter {iteration}",
+                )
+            if view_index in previous_normals:
+                normal_delta = gaussian_normals_map - previous_normals[view_index]
+                if normal_delta.ndim == 3:
+                    normal_diff = np.linalg.norm(normal_delta, axis=-1)
+                else:
+                    normal_diff = np.abs(normal_delta)
+                save_heatmap(
+                    normal_diff,
+                    lock_view_output_dir / f"normal_diff_iter_{iteration:02d}_temporal.png",
+                    f"Normal Δ iter {iteration}",
                 )
 
         if lock_view_mode:
