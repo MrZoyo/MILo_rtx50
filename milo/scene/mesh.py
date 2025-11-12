@@ -552,6 +552,17 @@ class ScalableMeshRenderer(torch.nn.Module):
             filtered_pix_to_face = filtered_pix_to_face - 1
             mesh = Meshes(verts=mesh.verts, faces=filtered_faces, verts_colors=mesh.verts_colors)
             fragments.pix_to_face = filtered_pix_to_face
+
+        if mesh.faces.shape[0] == 0:
+            H, W = fragments.zbuf.shape[1:3]
+            output_pkg = {}
+            if return_depth:
+                output_pkg["depth"] = torch.zeros(1, H, W, 1, device=mesh.verts.device)
+            if return_normals:
+                output_pkg["normals"] = torch.zeros(1, H, W, 3, device=mesh.verts.device)
+            if return_pix_to_face:
+                output_pkg["pix_to_face"] = fragments.pix_to_face
+            return output_pkg
         
         # Rebuild rast_out
         rast_out = torch.zeros(*fragments.zbuf.shape[:-1], 4, device=fragments.zbuf.device)
@@ -580,14 +591,21 @@ class ScalableMeshRenderer(torch.nn.Module):
             color_idx = features.shape[-1]
             features = torch.cat([features, mesh.verts_colors], dim=-1)  # Shape (N, n_features)
         
+        # Short-circuit: no visible triangles -> return zero maps
+        if mesh.faces.shape[0] == 0:
+            H, W = fragments.zbuf.shape[1:3]
+            if return_depth:
+                output_pkg["depth"] = torch.zeros(1, H, W, 1, device=mesh.verts.device)
+            if return_colors:
+                output_pkg["rgb"] = torch.zeros(1, H, W, 3, device=mesh.verts.device)
+            if return_normals:
+                output_pkg["normals"] = torch.zeros(1, H, W, 3, device=mesh.verts.device)
+            if return_pix_to_face:
+                output_pkg["pix_to_face"] = fragments.pix_to_face
+            return output_pkg
+
         # Compute image
-        if True:
-            feature_img, _ = dr.interpolate(features[None], rast_out, mesh.faces)  # Shape (1, H, W, n_features)
-        else:
-            pix_to_verts = mesh.faces[fragments.pix_to_face]  # Shape (1, H, W, 1, 3)
-            pix_to_features = features[pix_to_verts]  # Shape (1, H, W, 1, 3, n_features)
-            feature_img = (pix_to_features * fragments.bary_coords[..., None]).sum(dim=-2)  # Shape (1, H, W, 1, n_features)
-            feature_img = feature_img.squeeze(-2)  # Shape (1, H, W, n_features)
+        feature_img, _ = dr.interpolate(features[None], rast_out, mesh.faces)  # Shape (1, H, W, n_features)
         
         # Antialiasing for propagating gradients
         if use_antialiasing:
