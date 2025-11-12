@@ -546,7 +546,12 @@ def save_heatmap(data: np.ndarray, output_path: Path, title: str) -> None:
 
 def main():
     parser = ArgumentParser(description="桥梁场景高斯到网格迭代分析脚本")
-    parser.add_argument("--num_iterations", type=int, default=5, help="执行循环的次数")
+    parser.add_argument(
+        "--num_iterations",
+        type=int,
+        default=5,
+        help="执行循环的次数（未启用 --lock_view_repeat 时生效）",
+    )
     parser.add_argument("--ma_beta", type=float, default=0.8, help="loss 滑动平均系数")
     parser.add_argument(
         "--depth_loss_weight", type=float, default=1.0, help="深度一致性项权重"
@@ -617,10 +622,10 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=0, help="控制随机性的种子")
     parser.add_argument(
-        "--lock_view_index",
+        "--lock_view_repeat",
         type=int,
         default=None,
-        help="固定视角索引，仅在指定时输出热力图",
+        help="启用视角锁定调试模式时指定同一视角连续迭代次数，启用后总迭代数=视角数量×该值并忽略 --num_iterations；未提供则关闭该模式",
     )
     parser.add_argument(
         "--log_interval",
@@ -668,12 +673,21 @@ def main():
     pipe = PipelineParams(parser)
     args = parser.parse_args()
 
+    lock_view_mode = args.lock_view_repeat is not None
+    lock_repeat = max(1, args.lock_view_repeat) if lock_view_mode else 1
+
     pipe.debug = getattr(args, "debug", False)
 
     # 所有输出固定写入 milo/runs/ 下，便于管理实验产物
     base_run_dir = Path(__file__).resolve().parent / "runs"
     output_dir = base_run_dir / args.heatmap_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    iteration_image_dir = output_dir / "iteration_images"
+    iteration_image_dir.mkdir(parents=True, exist_ok=True)
+    lock_view_output_dir: Optional[Path] = None
+    if lock_view_mode:
+        lock_view_output_dir = output_dir / "lock_view_repeat"
+        lock_view_output_dir.mkdir(parents=True, exist_ok=True)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -713,13 +727,20 @@ def main():
     )
     num_views = len(train_cameras)
     print(f"[INFO] 成功加载 {num_views} 个相机视角。")
+    if lock_view_mode:
+        total_iterations = num_views * lock_repeat
+        print(
+            f"[INFO] 启用视角锁定调试：每个视角连续 {lock_repeat} 次，总迭代数 {total_iterations}（已忽略 --num_iterations）。"
+        )
+    else:
+        total_iterations = args.num_iterations
 
     device = gaussians._xyz.device
     background = torch.tensor([0.0, 0.0, 0.0], device=device)
 
     mesh_config = load_mesh_config(args.mesh_config)
     mesh_config["start_iter"] = max(0, args.mesh_start_iter)
-    mesh_config["stop_iter"] = max(mesh_config.get("stop_iter", args.num_iterations), args.num_iterations)
+    mesh_config["stop_iter"] = max(mesh_config.get("stop_iter", total_iterations), total_iterations)
     mesh_config["mesh_update_interval"] = max(1, args.mesh_update_interval)
     mesh_config["delaunay_reset_interval"] = args.delaunay_reset_interval
     mesh_config["depth_weight"] = args.mesh_depth_weight
@@ -797,14 +818,18 @@ def main():
     previous_normals: Dict[int, np.ndarray] = {}
     camera_stack = list(range(num_views))
     random.shuffle(camera_stack)
+    lock_sequence = list(range(num_views)) if lock_view_mode else []
+    lock_view_ptr = 0
+    lock_repeat_ptr = 0
     save_interval = args.save_interval if args.save_interval is not None else args.delaunay_reset_interval
     if save_interval is None or save_interval <= 0:
         save_interval = 1
+    log_interval = max(1, args.log_interval)
 
-    for iteration in range(args.num_iterations):
+    for iteration in range(total_iterations):
         optimizer.zero_grad(set_to_none=True)
-        if args.lock_view_index is not None:
-            view_index = args.lock_view_index % num_views
+        if lock_view_mode:
+            view_index = lock_sequence[lock_view_ptr]
         else:
             if not camera_stack:
                 camera_stack = list(range(num_views))
@@ -940,7 +965,7 @@ def main():
         def _fmt(value: float) -> str:
             return f"{value:.6f}"
 
-        if (iteration % max(1, args.log_interval) == 0) or (iteration == args.num_iterations - 1):
+        if (iteration % log_interval == 0) or (iteration == total_iterations - 1):
             print(
                 "[INFO] Iter {iter:02d} | loss={total} (depth={depth}, normal={normal}, mesh={mesh}) | ma_loss={ma}".format(
                     iter=iteration,
@@ -968,7 +993,7 @@ def main():
             else:
                 shared_min, shared_max = 0.0, 1.0
 
-            gaussian_depth_vis_path = output_dir / f"gaussian_depth_vis_iter_{iteration:02d}.png"
+            gaussian_depth_vis_path = iteration_image_dir / f"gaussian_depth_vis_iter_{iteration:02d}.png"
             plt.imsave(
                 gaussian_depth_vis_path,
                 gaussian_depth_map,
@@ -977,7 +1002,7 @@ def main():
                 vmax=shared_max,
             )
 
-            depth_vis_path = output_dir / f"mesh_depth_vis_iter_{iteration:02d}.png"
+            depth_vis_path = iteration_image_dir / f"mesh_depth_vis_iter_{iteration:02d}.png"
             plt.imsave(
                 depth_vis_path,
                 mesh_depth_map,
@@ -986,7 +1011,7 @@ def main():
                 vmax=shared_max,
             )
 
-            gt_depth_vis_path = output_dir / f"gt_depth_vis_iter_{iteration:02d}.png"
+            gt_depth_vis_path = iteration_image_dir / f"gt_depth_vis_iter_{iteration:02d}.png"
             plt.imsave(
                 gt_depth_vis_path,
                 gt_depth_map,
@@ -995,15 +1020,15 @@ def main():
                 vmax=shared_max,
             )
 
-            normal_vis_path = output_dir / f"mesh_normal_vis_iter_{iteration:02d}.png"
+            normal_vis_path = iteration_image_dir / f"mesh_normal_vis_iter_{iteration:02d}.png"
             mesh_normals_rgb = normals_to_rgb(mesh_normals_map)
             save_normal_visualization(mesh_normals_rgb, normal_vis_path)
 
-            gaussian_normal_vis_path = output_dir / f"gaussian_normal_vis_iter_{iteration:02d}.png"
+            gaussian_normal_vis_path = iteration_image_dir / f"gaussian_normal_vis_iter_{iteration:02d}.png"
             gaussian_normals_rgb = normals_to_rgb(gaussian_normals_map)
             save_normal_visualization(gaussian_normals_rgb, gaussian_normal_vis_path)
 
-            gt_normal_vis_path = output_dir / f"gt_normal_vis_iter_{iteration:02d}.png"
+            gt_normal_vis_path = iteration_image_dir / f"gt_normal_vis_iter_{iteration:02d}.png"
             gt_normals_rgb = normals_to_rgb(gt_normals_map)
             save_normal_visualization(gt_normals_rgb, gt_normal_vis_path)
 
@@ -1039,11 +1064,11 @@ def main():
                 depth_diff_vis[overlap_mask] = depth_delta[overlap_mask]
                 save_heatmap(
                     np.abs(depth_diff_vis),
-                    output_dir / f"depth_diff_iter_{iteration:02d}.png",
+                    iteration_image_dir / f"depth_diff_iter_{iteration:02d}.png",
                     f"|Pred-GT| iter {iteration}",
                 )
 
-            composite_path = output_dir / f"comparison_iter_{iteration:02d}.png"
+            composite_path = iteration_image_dir / f"comparison_iter_{iteration:02d}.png"
             fig, axes = plt.subplots(2, 3, figsize=(18, 10), dpi=300)
             ax_gt_depth, ax_gaussian_depth, ax_mesh_depth = axes[0]
             ax_gt_normals, ax_gaussian_normals, ax_mesh_normals = axes[1]
@@ -1092,12 +1117,12 @@ def main():
             fig.savefig(composite_path, dpi=300)
             plt.close(fig)
 
-            if args.lock_view_index is not None:
+            if lock_view_mode and lock_view_output_dir is not None:
                 if view_index in previous_depth:
                     depth_diff = np.abs(gaussian_depth_map - previous_depth[view_index])
                     save_heatmap(
                         depth_diff,
-                        output_dir / f"depth_diff_iter_{iteration:02d}_temporal.png",
+                        lock_view_output_dir / f"depth_diff_iter_{iteration:02d}_temporal.png",
                         f"Depth Δ iter {iteration}",
                     )
                 if view_index in previous_normals:
@@ -1108,7 +1133,7 @@ def main():
                         normal_diff = np.abs(normal_delta)
                     save_heatmap(
                         normal_diff,
-                        output_dir / f"normal_diff_iter_{iteration:02d}_temporal.png",
+                        lock_view_output_dir / f"normal_diff_iter_{iteration:02d}_temporal.png",
                         f"Normal Δ iter {iteration}",
                     )
 
@@ -1120,9 +1145,13 @@ def main():
                     reference_camera=None,
                 )
 
-        if args.lock_view_index is not None:
+        if lock_view_mode:
             previous_depth[view_index] = gaussian_depth_map
             previous_normals[view_index] = gaussian_normals_map
+            lock_repeat_ptr += 1
+            if lock_repeat_ptr >= lock_repeat:
+                lock_repeat_ptr = 0
+                lock_view_ptr = (lock_view_ptr + 1) % num_views
     with torch.no_grad():
         # 输出完整指标轨迹及汇总曲线，方便任务结束后快速复盘
         history_npz = output_dir / "metrics_history.npz"
