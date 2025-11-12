@@ -311,6 +311,83 @@ def load_mesh_config(config_name: str) -> Dict[str, Any]:
         return yaml.safe_load(fh)
 
 
+def load_optimization_config(config_name: str) -> Dict[str, Any]:
+    """加载优化配置文件，支持直接传文件路径或 configs/optimization/<name>.yaml。"""
+    candidate = Path(config_name)
+    if not candidate.is_file():
+        candidate = Path(__file__).resolve().parent / "configs" / "optimization" / f"{config_name}.yaml"
+    if not candidate.is_file():
+        raise FileNotFoundError(f"无法找到优化配置：{config_name}")
+    with candidate.open("r", encoding="utf-8") as fh:
+        config = yaml.safe_load(fh)
+
+    # 验证配置结构
+    required_keys = ["gaussian_params", "loss_weights", "depth_processing", "mesh_regularization"]
+    for key in required_keys:
+        if key not in config:
+            raise ValueError(f"优化配置文件缺少必需的键：{key}")
+
+    return config
+
+
+def setup_gaussian_optimization(
+    gaussians: GaussianModel,
+    opt_config: Dict[str, Any],
+) -> Tuple[torch.optim.Optimizer, Dict[str, float]]:
+    """
+    根据优化配置设置高斯参数的可训练性和优化器。
+
+    Args:
+        gaussians: 高斯模型实例
+        opt_config: 优化配置字典
+
+    Returns:
+        optimizer: 配置好的优化器
+        loss_weights: 损失权重字典
+    """
+    param_groups = []
+    params_config = opt_config["gaussian_params"]
+
+    # 遍历所有配置的参数
+    for param_name, param_cfg in params_config.items():
+        if not hasattr(gaussians, param_name):
+            print(f"[WARNING] 高斯模型没有属性 {param_name}，跳过")
+            continue
+
+        param_tensor = getattr(gaussians, param_name)
+        if not isinstance(param_tensor, torch.Tensor):
+            print(f"[WARNING] {param_name} 不是张量，跳过")
+            continue
+
+        trainable = param_cfg.get("trainable", False)
+        lr = param_cfg.get("lr", 0.0)
+
+        # 设置梯度
+        param_tensor.requires_grad_(trainable)
+
+        # 如果可训练且学习率>0，添加到优化器参数组
+        if trainable and lr > 0.0:
+            param_groups.append({
+                "params": [param_tensor],
+                "lr": lr,
+                "name": param_name
+            })
+            print(f"[INFO] 参数 {param_name}: trainable=True, lr={lr}")
+        else:
+            print(f"[INFO] 参数 {param_name}: trainable=False")
+
+    if not param_groups:
+        raise ValueError("没有可训练的参数！请检查优化配置文件。")
+
+    # 创建优化器
+    optimizer = torch.optim.Adam(param_groups)
+
+    # 提取损失权重
+    loss_weights = opt_config["loss_weights"]
+
+    return optimizer, loss_weights
+
+
 def ensure_gaussian_occupancy(gaussians: GaussianModel) -> None:
     """mesh regularization 依赖 9 维 occupancy 网格，此处在推理环境补齐缓冲。"""
     needs_init = (
@@ -561,20 +638,55 @@ def main():
         help="执行循环的次数（未启用 --lock_view_repeat 时生效）",
     )
     parser.add_argument("--ma_beta", type=float, default=0.8, help="loss 滑动平均系数")
+
+    # ========== 新增：优化配置文件参数 ==========
     parser.add_argument(
-        "--depth_loss_weight", type=float, default=1.0, help="深度一致性项权重"
+        "--opt_config",
+        type=str,
+        default="default",
+        help="优化配置名称或完整路径（默认 default，查找 configs/optimization/default.yaml）",
+    )
+
+    # ========== 保留旧参数以向后兼容，但会被YAML配置覆盖 ==========
+    parser.add_argument(
+        "--depth_loss_weight", type=float, default=None, help="(已弃用，请使用 --opt_config) 深度一致性项权重"
     )
     parser.add_argument(
-        "--normal_loss_weight", type=float, default=1.0, help="法线一致性项权重"
+        "--normal_loss_weight", type=float, default=None, help="(已弃用，请使用 --opt_config) 法线一致性项权重"
     )
     parser.add_argument(
         "--lr",
         "--learning_rate",
         dest="lr",
         type=float,
-        default=5e-4,
-        help="仅优化 XYZ 的学习率（默认 5e-4）",
+        default=None,
+        help="(已弃用，请使用 --opt_config) 仅优化 XYZ 的学习率",
     )
+    parser.add_argument(
+        "--depth_clip_min",
+        type=float,
+        default=None,
+        help="(已弃用，请使用 --opt_config) 深度最小裁剪值",
+    )
+    parser.add_argument(
+        "--depth_clip_max",
+        type=float,
+        default=None,
+        help="(已弃用，请使用 --opt_config) 深度最大裁剪值",
+    )
+    parser.add_argument(
+        "--mesh_depth_weight",
+        type=float,
+        default=None,
+        help="(已弃用，请使用 --opt_config) mesh 深度项权重覆盖",
+    )
+    parser.add_argument(
+        "--mesh_normal_weight",
+        type=float,
+        default=None,
+        help="(已弃用，请使用 --opt_config) mesh 法线项权重覆盖",
+    )
+
     parser.add_argument(
         "--delaunay_reset_interval",
         type=int,
@@ -604,18 +716,6 @@ def main():
         type=str,
         default="/home/zoyo/Desktop/MILo_rtx50/milo/data/bridge_clean/depth",
         help="Discoverse 深度 npy 所在目录",
-    )
-    parser.add_argument(
-        "--depth_clip_min",
-        type=float,
-        default=0.0,
-        help="深度最小裁剪值，<=0 表示不裁剪",
-    )
-    parser.add_argument(
-        "--depth_clip_max",
-        type=float,
-        default=None,
-        help="深度最大裁剪值，None 表示不裁剪",
     )
     parser.add_argument(
         "--normal_cache_dir",
@@ -666,20 +766,28 @@ def main():
         default=5,
         help="mesh 正则重建/回传间隔，>1 可减少 DMTet 抖动（默认 5）",
     )
-    parser.add_argument(
-        "--mesh_depth_weight",
-        type=float,
-        default=0.1,
-        help="mesh 深度项权重覆盖（默认 0.1，原配置通常为 0.05）",
-    )
-    parser.add_argument(
-        "--mesh_normal_weight",
-        type=float,
-        default=0.1,
-        help="mesh 法线项权重覆盖（默认 0.1，原配置通常为 0.05）",
-    )
     pipe = PipelineParams(parser)
     args = parser.parse_args()
+
+    # ========== 加载优化配置 ==========
+    print(f"[INFO] 加载优化配置：{args.opt_config}")
+    opt_config = load_optimization_config(args.opt_config)
+
+    # 兼容性：如果命令行指定了旧参数，发出警告并使用YAML配置
+    if args.depth_loss_weight is not None:
+        print(f"[WARNING] --depth_loss_weight 已弃用，将使用YAML配置中的值")
+    if args.normal_loss_weight is not None:
+        print(f"[WARNING] --normal_loss_weight 已弃用，将使用YAML配置中的值")
+    if args.lr is not None:
+        print(f"[WARNING] --lr 已弃用，将使用YAML配置中的学习率设置")
+    if args.depth_clip_min is not None:
+        print(f"[WARNING] --depth_clip_min 已弃用，将使用YAML配置中的值")
+    if args.depth_clip_max is not None:
+        print(f"[WARNING] --depth_clip_max 已弃用，将使用YAML配置中的值")
+    if args.mesh_depth_weight is not None:
+        print(f"[WARNING] --mesh_depth_weight 已弃用，将使用YAML配置中的值")
+    if args.mesh_normal_weight is not None:
+        print(f"[WARNING] --mesh_normal_weight 已弃用，将使用YAML配置中的值")
 
     lock_view_mode = args.lock_view_repeat is not None
     lock_repeat = max(1, args.lock_view_repeat) if lock_view_mode else 1
@@ -708,20 +816,10 @@ def main():
 
     gaussians = GaussianModel(sh_degree=0, learn_occupancy=True)
     gaussians.load_ply(ply_path)
-    freeze_attrs = [
-        "_features_dc",
-        "_features_rest",
-        "_scaling",
-        "_rotation",
-        "_opacity",
-        "_base_occupancy",
-        "_occupancy_shift",
-    ]
-    for attr in freeze_attrs:
-        value = getattr(gaussians, attr, None)
-        if isinstance(value, torch.Tensor):
-            value.requires_grad_(False)
-    gaussians._xyz.requires_grad_(True)
+
+    # ========== 使用新的优化配置设置参数 ==========
+    print("[INFO] 配置高斯参数优化...")
+    optimizer, loss_weights = setup_gaussian_optimization(gaussians, opt_config)
 
     height = 720
     width = 1280
@@ -746,13 +844,19 @@ def main():
     device = gaussians._xyz.device
     background = torch.tensor([0.0, 0.0, 0.0], device=device)
 
+    # ========== 应用优化配置到mesh和深度处理 ==========
     mesh_config = load_mesh_config(args.mesh_config)
     mesh_config["start_iter"] = max(0, args.mesh_start_iter)
     mesh_config["stop_iter"] = max(mesh_config.get("stop_iter", total_iterations), total_iterations)
     mesh_config["mesh_update_interval"] = max(1, args.mesh_update_interval)
     mesh_config["delaunay_reset_interval"] = args.delaunay_reset_interval
-    mesh_config["depth_weight"] = args.mesh_depth_weight
-    mesh_config["normal_weight"] = args.mesh_normal_weight
+
+    # 从优化配置中获取mesh权重
+    mesh_reg_config = opt_config["mesh_regularization"]
+    mesh_config["depth_weight"] = mesh_reg_config["depth_weight"]
+    mesh_config["normal_weight"] = mesh_reg_config["normal_weight"]
+    print(f"[INFO] Mesh正则化权重: depth={mesh_config['depth_weight']}, normal={mesh_config['normal_weight']}")
+
     # 这里默认沿用 surface 采样以对齐训练阶段；如仅需快速分析，也可以切换为 random 提升速度。
     mesh_config["delaunay_sampling_method"] = "surface"
 
@@ -765,8 +869,14 @@ def main():
 
     render_view, render_for_sdf = build_render_functions(gaussians, pipe, background)
 
-    depth_clip_min = args.depth_clip_min if args.depth_clip_min > 0.0 else None
-    depth_clip_max = args.depth_clip_max
+    # 从优化配置中获取深度处理参数
+    depth_proc_config = opt_config["depth_processing"]
+    depth_clip_min = depth_proc_config.get("clip_min")
+    depth_clip_max = depth_proc_config.get("clip_max")
+    if depth_clip_min is not None and depth_clip_min <= 0.0:
+        depth_clip_min = None
+    print(f"[INFO] 深度裁剪范围: min={depth_clip_min}, max={depth_clip_max}")
+
     depth_provider = DepthProvider(
         depth_root=Path(args.depth_gt_dir),
         image_height=height,
@@ -798,11 +908,16 @@ def main():
     mesh_state["reset_delaunay_samples"] = True
     mesh_state["reset_sdf_values"] = True
 
-    optimizer = torch.optim.Adam([gaussians._xyz], lr=args.lr)
+    # optimizer已在setup_gaussian_optimization中创建
     mesh_args = SimpleNamespace(
         warn_until_iter=args.warn_until_iter,
         imp_metric=args.imp_metric,
     )
+
+    # 输出loss权重配置
+    print(f"[INFO] Loss权重配置:")
+    for loss_name, weight in loss_weights.items():
+        print(f"         > {loss_name}: {weight}")
 
     # 记录整个迭代过程中的指标与梯度，结束时统一写入 npz/曲线
     stats_history: Dict[str, List[float]] = {
@@ -905,9 +1020,11 @@ def main():
 
         mesh_state = mesh_pkg["updated_state"]
         mesh_loss_tensor = mesh_pkg["mesh_loss"]
+
+        # ========== 使用YAML配置的loss权重 ==========
         total_loss = (
-            args.depth_loss_weight * depth_loss_tensor
-            + args.normal_loss_weight * normal_loss_tensor
+            loss_weights["depth"] * depth_loss_tensor
+            + loss_weights["normal"] * normal_loss_tensor
             + mesh_loss_tensor
         )
         depth_loss_value = float(depth_loss_tensor.detach().item())
@@ -917,7 +1034,13 @@ def main():
 
         if total_loss.requires_grad:
             total_loss.backward()
-            grad_norm = float(gaussians._xyz.grad.detach().norm().item())
+            # 计算所有可训练参数的总梯度范数
+            total_grad_norm_sq = 0.0
+            for param_group in optimizer.param_groups:
+                for param in param_group["params"]:
+                    if param.grad is not None:
+                        total_grad_norm_sq += param.grad.detach().norm().item() ** 2
+            grad_norm = float(total_grad_norm_sq ** 0.5)
             optimizer.step()
         else:
             optimizer.zero_grad(set_to_none=True)
@@ -1116,8 +1239,8 @@ def main():
                 f"GT depth valid px: {int(gt_valid.sum())}",
                 f"Gaussian depth valid px: {int(gaussian_valid.sum())}",
                 f"|Pred - GT| mean={diff_mean:.3f}, max={diff_max:.3f}, RMSE={diff_rmse:.3f}",
-                f"Depth loss={_fmt(depth_loss_value)} (w={args.depth_loss_weight:.2f}, mae={depth_stats['mae']:.3f}, rmse={depth_stats['rmse']:.3f})",
-                f"Normal loss={_fmt(normal_loss_value)} (w={args.normal_loss_weight:.2f}, px={normal_stats['valid_px']}, cos={normal_stats['mean_cos']:.3f})",
+                f"Depth loss={_fmt(depth_loss_value)} (w={loss_weights['depth']:.2f}, mae={depth_stats['mae']:.3f}, rmse={depth_stats['rmse']:.3f})",
+                f"Normal loss={_fmt(normal_loss_value)} (w={loss_weights['normal']:.2f}, px={normal_stats['valid_px']}, cos={normal_stats['mean_cos']:.3f})",
                 f"Mesh loss={_fmt(mesh_loss_value)}",
                 f"Mesh depth loss={_fmt(mesh_depth_loss)} mesh normal loss={_fmt(mesh_normal_loss)}",
                 f"Occupied centers={_fmt(occupied_loss)} labels={_fmt(labels_loss)}",
