@@ -534,9 +534,17 @@ def load_cameras_from_json(
 
 def save_heatmap(data: np.ndarray, output_path: Path, title: str) -> None:
     """将二维数据保存为热力图，便于直观观察差异。"""
-    # 迭代间深度 / 法线差分可视化，快速定位局部变化
     plt.figure(figsize=(6, 4))
-    plt.imshow(data, cmap="inferno")
+    finite_mask = np.isfinite(data)
+    if finite_mask.any():
+        finite_values = data[finite_mask]
+        vmax = float(np.percentile(finite_values, 99.0))
+        if (not np.isfinite(vmax)) or (vmax <= 0.0):
+            vmax = 1.0
+    else:
+        vmax = 1.0
+    masked_data = np.ma.array(data, mask=~finite_mask)
+    plt.imshow(masked_data, cmap="inferno", vmin=0.0, vmax=vmax)
     plt.title(title)
     plt.colorbar()
     plt.tight_layout()
@@ -1060,10 +1068,12 @@ def main():
             )
 
             if overlap_mask.any():
-                depth_diff_vis = np.zeros_like(gaussian_depth_map)
-                depth_diff_vis[overlap_mask] = depth_delta[overlap_mask]
+                depth_diff_vis = np.full_like(
+                    gaussian_depth_map, np.nan, dtype=np.float32
+                )
+                depth_diff_vis[overlap_mask] = np.abs(depth_delta[overlap_mask])
                 save_heatmap(
-                    np.abs(depth_diff_vis),
+                    depth_diff_vis,
                     iteration_image_dir / f"depth_diff_iter_{iteration:02d}.png",
                     f"|Pred-GT| iter {iteration}",
                 )
@@ -1127,23 +1137,44 @@ def main():
 
         if lock_view_mode and lock_view_output_dir is not None:
             if view_index in previous_depth:
-                depth_diff = np.abs(gaussian_depth_map - previous_depth[view_index])
-                save_heatmap(
-                    depth_diff,
-                    lock_view_output_dir / f"depth_diff_iter_{iteration:02d}_temporal.png",
-                    f"Depth Δ iter {iteration}",
+                prev_depth_map = previous_depth[view_index]
+                depth_valid_mask = (
+                    np.isfinite(prev_depth_map)
+                    & np.isfinite(gaussian_depth_map)
+                    & (prev_depth_map > 0.0)
+                    & (gaussian_depth_map > 0.0)
                 )
+                if depth_valid_mask.any():
+                    depth_delta = np.abs(gaussian_depth_map - prev_depth_map)
+                    depth_diff = np.full_like(
+                        gaussian_depth_map, np.nan, dtype=np.float32
+                    )
+                    depth_diff[depth_valid_mask] = depth_delta[depth_valid_mask]
+                    save_heatmap(
+                        depth_diff,
+                        lock_view_output_dir / f"depth_diff_iter_{iteration:02d}_temporal.png",
+                        f"Depth Δ iter {iteration}",
+                    )
             if view_index in previous_normals:
-                normal_delta = gaussian_normals_map - previous_normals[view_index]
-                if normal_delta.ndim == 3:
-                    normal_diff = np.linalg.norm(normal_delta, axis=-1)
-                else:
-                    normal_diff = np.abs(normal_delta)
-                save_heatmap(
-                    normal_diff,
-                    lock_view_output_dir / f"normal_diff_iter_{iteration:02d}_temporal.png",
-                    f"Normal Δ iter {iteration}",
-                )
+                prev_normals_map = previous_normals[view_index]
+                normal_valid_mask = np.all(
+                    np.isfinite(prev_normals_map), axis=-1
+                ) & np.all(np.isfinite(gaussian_normals_map), axis=-1)
+                if normal_valid_mask.any():
+                    normal_delta = gaussian_normals_map - prev_normals_map
+                    if normal_delta.ndim == 3:
+                        normal_diff = np.linalg.norm(normal_delta, axis=-1)
+                    else:
+                        normal_diff = np.abs(normal_delta)
+                    normal_diff_vis = np.full_like(
+                        normal_diff, np.nan, dtype=np.float32
+                    )
+                    normal_diff_vis[normal_valid_mask] = normal_diff[normal_valid_mask]
+                    save_heatmap(
+                        normal_diff_vis,
+                        lock_view_output_dir / f"normal_diff_iter_{iteration:02d}_temporal.png",
+                        f"Normal Δ iter {iteration}",
+                    )
 
         if lock_view_mode:
             previous_depth[view_index] = gaussian_depth_map
