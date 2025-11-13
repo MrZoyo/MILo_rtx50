@@ -948,6 +948,7 @@ def main():
     if save_interval is None or save_interval <= 0:
         save_interval = 1
     log_interval = max(1, args.log_interval)
+    mesh_export_warned = False
 
     for iteration in range(total_iterations):
         optimizer.zero_grad(set_to_none=True)
@@ -1250,13 +1251,21 @@ def main():
             fig.savefig(composite_path, dpi=300)
             plt.close(fig)
 
-            with torch.no_grad():
-                export_mesh_from_state(
-                    gaussians=gaussians,
-                    mesh_state=mesh_state,
-                    output_path=output_dir / f"mesh_iter_{iteration:02d}.ply",
-                    reference_camera=None,
-                )
+            mesh_ready_for_export = mesh_active or mesh_state.get("delaunay_tets") is not None
+            if mesh_ready_for_export:
+                with torch.no_grad():
+                    export_mesh_from_state(
+                        gaussians=gaussians,
+                        mesh_state=mesh_state,
+                        output_path=output_dir / f"mesh_iter_{iteration:02d}.ply",
+                        reference_camera=None,
+                    )
+            else:
+                if not mesh_export_warned:
+                    print(
+                        "[INFO] Mesh 正则尚未启动或尚未生成 Delaunay，已跳过网格导出以避免全量三角化。"
+                    )
+                    mesh_export_warned = True
 
         if lock_view_mode and lock_view_output_dir is not None:
             if view_index in previous_depth:
